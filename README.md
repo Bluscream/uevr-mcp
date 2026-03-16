@@ -6,7 +6,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 - **Read and write live state.** Player health, enemy AI, physics, materials, animations, transforms — the agent sees what the game sees, in real time.
 - **Full VR control.** HMD and controller poses, haptic feedback, snap turn, aim method, motion controller attachment — complete VR subsystem access.
 - **Live Lua scripting.** Execute Lua code in the game process with persistent state, frame callbacks, timers, async coroutines, and a module system. Hot-reload scripts without losing state. Write and deploy scripts to the UEVR autorun folder.
-- **Screenshot from the GPU.** Capture the game's D3D11 backbuffer as JPEG — works even when the game window is behind other windows.
+- **Screenshot from the GPU.** Capture the game's D3D11 or D3D12 backbuffer as JPEG — works even when the game window is behind other windows. Handles R10G10B10A2, FP16 HDR, BGRA8, and RGBA8 formats with high-quality WIC scaling.
 - **Reverse-engineer anything.** Snapshot an object's state, perform an action, diff to see what changed. Hook any UFunction to log calls, block execution, or run Lua callbacks with argument inspection. Watch properties with Lua triggers for reactive scripting.
 - **Real-time event streaming.** Poll for hook fires, watch changes, and Lua output in real time via long-polling.
 - **Works across games.** Same 112 tools work on any Unreal Engine game that UEVR supports.
@@ -67,7 +67,7 @@ The plugin is a C++ DLL loaded by UEVR into the game process. It uses the UEVR C
 2. **Object inspection** reads field values from live objects via FProperty offsets
 3. **Method invocation** calls UFunctions through `process_event` with full parameter marshaling
 4. **Chain queries** walk the object graph server-side, expanding fields, calling methods, filtering, and collecting results in a single request
-5. **Screenshot capture** copies the D3D11 backbuffer on the present thread, encodes as JPEG via WIC
+5. **Screenshot capture** copies the D3D11 or D3D12 backbuffer on the present thread, encodes as JPEG via WIC
 6. **Lua execution** runs code in an embedded Sol2/Lua 5.4 state with UEVR API bindings
 
 The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP endpoint. A named pipe provides a secondary channel for status and log operations.
@@ -199,7 +199,7 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 
 | Tool | Description |
 |------|-------------|
-| `uevr_screenshot` | Capture from D3D11 backbuffer as JPEG. Works when game isn't in front. Configurable resolution and quality. |
+| `uevr_screenshot` | Capture from D3D11/D3D12 backbuffer as JPEG. Works when game isn't in front. Handles R10G10B10A2, FP16, BGRA8, RGBA8. Configurable resolution and quality. |
 | `uevr_screenshot_info` | Check if D3D capture is initialized and which renderer is in use |
 
 ### Property Watch & Snapshot/Diff (9 tools)
