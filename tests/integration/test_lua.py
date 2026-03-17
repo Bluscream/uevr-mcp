@@ -594,6 +594,88 @@ class TestLuaFrameCallbacks:
         requests.post(f"{api_url}/api/lua/exec",
                       json={"code": "mcp.clear_callbacks()"}, timeout=10)
 
+    def test_frame_callback_can_read_properties_without_crashing(self, require_game, api_url):
+        """Frame callbacks can read UObject properties without killing the plugin."""
+        setup_code = """
+        mcp.clear_callbacks()
+        _frame_prop_seen = false
+        _frame_prop_ok = false
+        mcp.on_frame(function(dt)
+            local pawn = uevr.api.get_local_pawn()
+            if not pawn then return end
+            _frame_prop_seen = true
+            local move = mcp.read_property(pawn:get_address(), "CharacterMovement")
+            if not move or move == 0 then return end
+            local gravity = mcp.read_property(move, "GravityScale")
+            if type(gravity) == "number" then
+                _frame_prop_ok = true
+            end
+        end)
+        """
+
+        try:
+            r = requests.post(f"{api_url}/api/lua/exec", json={"code": setup_code}, timeout=10)
+            assert r.json()["success"] is True
+
+            time.sleep(0.5)
+
+            state_r = requests.get(f"{api_url}/api/lua/state", timeout=5)
+            assert state_r.status_code == 200
+
+            result_r = requests.post(f"{api_url}/api/lua/exec", json={
+                "code": "return {seen = _frame_prop_seen, ok = _frame_prop_ok}"
+            }, timeout=10)
+            data = result_r.json()
+            assert data["success"] is True
+            assert data["result"]["seen"] is True
+            assert data["result"]["ok"] is True
+        finally:
+            requests.post(f"{api_url}/api/lua/exec",
+                          json={"code": "mcp.clear_callbacks()"}, timeout=10)
+
+
+class TestLuaTimers:
+    """Test mcp.set_timer() behavior."""
+
+    def test_timer_callback_can_read_properties_without_crashing(self, require_game, api_url):
+        """Timer callbacks can read UObject properties without killing the plugin."""
+        setup_code = """
+        mcp.clear_all_timers()
+        _timer_prop_seen = false
+        _timer_prop_ok = false
+        mcp.set_timer(0.05, function()
+            local pawn = uevr.api.get_local_pawn()
+            if not pawn then return end
+            _timer_prop_seen = true
+            local move = mcp.read_property(pawn:get_address(), "CharacterMovement")
+            if not move or move == 0 then return end
+            local gravity = mcp.read_property(move, "GravityScale")
+            if type(gravity) == "number" then
+                _timer_prop_ok = true
+            end
+        end, true)
+        """
+
+        try:
+            r = requests.post(f"{api_url}/api/lua/exec", json={"code": setup_code}, timeout=10)
+            assert r.json()["success"] is True
+
+            time.sleep(0.3)
+
+            state_r = requests.get(f"{api_url}/api/lua/state", timeout=5)
+            assert state_r.status_code == 200
+
+            result_r = requests.post(f"{api_url}/api/lua/exec", json={
+                "code": "return {seen = _timer_prop_seen, ok = _timer_prop_ok}"
+            }, timeout=10)
+            data = result_r.json()
+            assert data["success"] is True
+            assert data["result"]["seen"] is True
+            assert data["result"]["ok"] is True
+        finally:
+            requests.post(f"{api_url}/api/lua/exec",
+                          json={"code": "mcp.clear_all_timers()"}, timeout=10)
+
 
 class TestLuaReset:
     """Test POST /api/lua/reset — Reset Lua state."""

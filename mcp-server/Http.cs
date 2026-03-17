@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace UevrMcp;
 
@@ -7,6 +8,10 @@ static class Http
 {
     static readonly string Base = Environment.GetEnvironmentVariable("UEVR_MCP_API_URL") ?? "http://localhost:8899";
     static readonly HttpClient Client = new();
+    static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
 
     public static async Task<string> Get(string path, Dictionary<string, string?>? query = null)
     {
@@ -23,7 +28,7 @@ static class Http
 
     public static async Task<string> Post(string path, object body)
     {
-        var json = JsonSerializer.Serialize(body);
+        var json = JsonSerializer.Serialize(body, JsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var res = await Client.PostAsync(Base + path, content);
         return await res.Content.ReadAsStringAsync();
@@ -31,7 +36,7 @@ static class Http
 
     public static async Task<string> Delete(string path, object body)
     {
-        var json = JsonSerializer.Serialize(body);
+        var json = JsonSerializer.Serialize(body, JsonOptions);
         var request = new HttpRequestMessage(HttpMethod.Delete, Base + path)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")

@@ -2,11 +2,14 @@
 #include "../pipe_server.h"
 #include "../json_helpers.h"
 #include "../event_bus.h"
+#include "../reflection/object_explorer.h"
+#include "../reflection/property_writer.h"
 
 #define SOL_ALL_SAFETIES_ON 1
 #include <sol/sol.hpp>
 
 #include <uevr/API.hpp>
+#include <windows.h>
 #include <chrono>
 #include <sstream>
 #include <fstream>
@@ -108,6 +111,60 @@ static json sol_to_json(const sol::object& obj) {
         return json{{"_type", "unknown"}};
     }
 }
+
+namespace {
+
+class LuaInstructionHookGuard {
+public:
+    explicit LuaInstructionHookGuard(lua_State* state) : m_state(state) {
+        lua_sethook(m_state, instruction_count_hook, LUA_MASKCOUNT, LUA_INSTRUCTION_LIMIT);
+    }
+
+    ~LuaInstructionHookGuard() {
+        if (m_state != nullptr) {
+            lua_sethook(m_state, nullptr, 0, 0);
+        }
+    }
+
+private:
+    lua_State* m_state{};
+};
+
+static void log_current_exception(const std::string& context) {
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        PipeServer::get().log(context + ": " + e.what());
+    } catch (...) {
+        PipeServer::get().log(context + ": unknown C++ exception");
+    }
+}
+
+template <typename T>
+static bool try_read_memory(uintptr_t addr, T& value) noexcept {
+    if (!addr) return false;
+
+    __try {
+        value = *reinterpret_cast<T*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <typename T>
+static bool try_write_memory(uintptr_t addr, T value) noexcept {
+    if (!addr) return false;
+
+    __try {
+        *reinterpret_cast<T*>(addr) = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
 
 // ── LuaEngine implementation ────────────────────────────────────────
 
@@ -246,6 +303,102 @@ void LuaEngine::setup_bindings() {
     mcp["clear_all_timers"] = [this]() {
         m_state->lua["_mcp_timers"] = m_state->lua.create_table();
         m_next_timer_id = 1;
+    };
+
+    // ── Safe raw memory access helpers ──────────────────────────────
+    mcp["read_float"] = [this](uintptr_t addr) -> sol::object {
+        float value{};
+        if (!try_read_memory(addr, value)) return sol::make_object(m_state->lua, sol::nil);
+        return sol::make_object(m_state->lua, value);
+    };
+    mcp["write_float"] = [](uintptr_t addr, float val) -> bool {
+        return try_write_memory(addr, val);
+    };
+    mcp["read_double"] = [this](uintptr_t addr) -> sol::object {
+        double value{};
+        if (!try_read_memory(addr, value)) return sol::make_object(m_state->lua, sol::nil);
+        return sol::make_object(m_state->lua, value);
+    };
+    mcp["write_double"] = [](uintptr_t addr, double val) -> bool {
+        return try_write_memory(addr, val);
+    };
+    mcp["read_int"] = [this](uintptr_t addr) -> sol::object {
+        int32_t value{};
+        if (!try_read_memory(addr, value)) return sol::make_object(m_state->lua, sol::nil);
+        return sol::make_object(m_state->lua, value);
+    };
+    mcp["write_int"] = [](uintptr_t addr, int32_t val) -> bool {
+        return try_write_memory(addr, val);
+    };
+    mcp["read_bool"] = [this](uintptr_t addr) -> sol::object {
+        bool value{};
+        if (!try_read_memory(addr, value)) return sol::make_object(m_state->lua, sol::nil);
+        return sol::make_object(m_state->lua, value);
+    };
+    mcp["write_bool"] = [](uintptr_t addr, bool val) -> bool {
+        return try_write_memory(addr, val);
+    };
+    mcp["read_ptr"] = [](uintptr_t addr) -> uintptr_t {
+        uintptr_t value{};
+        if (!try_read_memory(addr, value)) return 0;
+        return value;
+    };
+
+    // ── High-level safe property access via ObjectExplorer/PropertyWriter ──
+    mcp["read_property"] = [this](uintptr_t obj_addr, const std::string& field_name) -> sol::object {
+        auto& lua = m_state->lua;
+        if (!obj_addr) return sol::make_object(lua, sol::nil);
+
+        try {
+            auto result = ObjectExplorer::read_field(obj_addr, field_name);
+            if (result.contains("error")) return sol::make_object(lua, sol::nil);
+
+            if (result.contains("value")) {
+                auto& val = result["value"];
+                if (val.is_number_float()) return sol::make_object(lua, val.get<double>());
+                if (val.is_number_integer()) return sol::make_object(lua, val.get<int64_t>());
+                if (val.is_boolean()) return sol::make_object(lua, val.get<bool>());
+                if (val.is_string()) return sol::make_object(lua, val.get<std::string>());
+                if (val.is_object() && val.contains("address")) {
+                    auto addr_str = val["address"].get<std::string>();
+                    return sol::make_object(lua, JsonHelpers::string_to_address(addr_str));
+                }
+            }
+        } catch (...) {
+            log_current_exception("LuaEngine: read_property C++ exception");
+        }
+
+        return sol::make_object(lua, sol::nil);
+    };
+
+    mcp["write_property"] = [](uintptr_t obj_addr, const std::string& field_name, sol::object value) -> bool {
+        if (!obj_addr) return false;
+
+        try {
+            json json_val;
+            if (value.is<double>()) json_val = value.as<double>();
+            else if (value.is<bool>()) json_val = value.as<bool>();
+            else if (value.is<std::string>()) json_val = value.as<std::string>();
+            else if (value.is<int64_t>()) json_val = value.as<int64_t>();
+            else return false;
+
+            auto obj = reinterpret_cast<API::UObject*>(obj_addr);
+            if (!API::UObjectHook::exists(obj)) return false;
+
+            auto cls = obj->get_class();
+            if (!cls) return false;
+
+            auto wname = JsonHelpers::utf8_to_wide(field_name);
+            auto prop = cls->find_property(wname.c_str());
+            if (!prop) return false;
+
+            auto fprop = reinterpret_cast<API::FProperty*>(prop);
+            std::string error;
+            return PropertyWriter::write_property(obj, fprop, json_val, error);
+        } catch (...) {
+            log_current_exception("LuaEngine: write_property C++ exception");
+            return false;
+        }
     };
 }
 
@@ -597,31 +750,38 @@ json LuaEngine::execute(const std::string& code) {
     auto& lua = m_state->lua;
     auto start = std::chrono::high_resolution_clock::now();
 
-    // Set instruction count hook for infinite loop protection
-    lua_sethook(lua.lua_state(), instruction_count_hook, LUA_MASKCOUNT, LUA_INSTRUCTION_LIMIT);
-
-    auto result = lua.safe_script(code, sol::script_pass_on_error);
-
-    // Remove the hook
-    lua_sethook(lua.lua_state(), nullptr, 0, 0);
-
-    auto end = std::chrono::high_resolution_clock::now();
-    double exec_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
     json response;
-    response["output"] = m_output_buffer;
-    response["execTime_ms"] = exec_ms;
+    response["execTime_ms"] = 0.0;
 
-    if (result.valid()) {
-        sol::object val = result;
-        response["success"] = true;
-        response["result"] = sol_to_json(val);
-    } else {
-        sol::error err = result;
+    try {
+        LuaInstructionHookGuard hook_guard(lua.lua_state());
+        auto result = lua.safe_script(code, sol::script_pass_on_error);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        response["execTime_ms"] = std::chrono::duration<double, std::milli>(end - start).count();
+
+        if (result.valid()) {
+            sol::object val = result;
+            response["success"] = true;
+            response["result"] = sol_to_json(val);
+        } else {
+            sol::error err = result;
+            response["success"] = false;
+            response["error"] = err.what();
+        }
+    } catch (const std::exception& e) {
+        auto end = std::chrono::high_resolution_clock::now();
+        response["execTime_ms"] = std::chrono::duration<double, std::milli>(end - start).count();
         response["success"] = false;
-        response["error"] = err.what();
+        response["error"] = std::string("C++ exception during Lua execution: ") + e.what();
+    } catch (...) {
+        auto end = std::chrono::high_resolution_clock::now();
+        response["execTime_ms"] = std::chrono::duration<double, std::milli>(end - start).count();
+        response["success"] = false;
+        response["error"] = "Unknown C++ exception during Lua execution";
     }
 
+    response["output"] = m_output_buffer;
     return response;
 }
 
@@ -701,140 +861,169 @@ void LuaEngine::on_frame(float delta) {
 
     if (!m_initialized || !m_state) return;
 
-    auto& lua = m_state->lua;
-    sol::table callbacks = lua["_mcp_frame_callbacks"];
-    if (!callbacks.valid()) return;
+    try {
+        auto& lua = m_state->lua;
+        sol::table callbacks = lua["_mcp_frame_callbacks"];
+        if (!callbacks.valid()) return;
 
-    callbacks.for_each([&](const sol::object& key, const sol::object& val) {
-        if (val.get_type() != sol::type::function) return;
+        callbacks.for_each([&](const sol::object&, const sol::object& val) {
+            try {
+                if (val.get_type() != sol::type::function) return;
 
-        sol::protected_function fn = val.as<sol::protected_function>();
-        auto result = fn(delta);
-        if (!result.valid()) {
-            sol::error err = result;
-            PipeServer::get().log("LuaEngine: frame callback error: " + std::string(err.what()));
-        }
-    });
-
-    // ── Process timers ───────────────────────────────────────────────
-    sol::table timers = lua["_mcp_timers"];
-    if (!timers.valid()) return;
-
-    // Collect expired timer ids so we can modify the table after iteration
-    std::vector<int> to_remove;
-
-    timers.for_each([&](const sol::object& key, const sol::object& val) {
-        if (val.get_type() != sol::type::table) return;
-
-        sol::table entry = val.as<sol::table>();
-        float remaining = entry["remaining"].get_or(0.0f);
-        remaining -= delta;
-
-        if (remaining <= 0.0f) {
-            sol::optional<sol::protected_function> cb = entry["callback"];
-            if (cb.has_value()) {
-                auto result = cb.value()();
+                sol::protected_function fn = val.as<sol::protected_function>();
+                auto result = fn(delta);
                 if (!result.valid()) {
                     sol::error err = result;
-                    PipeServer::get().log("LuaEngine: timer callback error: " + std::string(err.what()));
+                    PipeServer::get().log("LuaEngine: frame callback error: " + std::string(err.what()));
                 }
+            } catch (...) {
+                log_current_exception("LuaEngine: frame callback dispatch exception");
             }
+        });
 
-            bool looping = entry["looping"].get_or(false);
-            if (looping) {
-                float delay = entry["delay"].get_or(0.0f);
-                entry["remaining"] = delay;
-            } else {
-                int id = entry["id"].get_or(0);
-                to_remove.push_back(id);
-            }
-        } else {
-            entry["remaining"] = remaining;
-        }
-    });
+        // ── Process timers ───────────────────────────────────────────────
+        sol::table timers = lua["_mcp_timers"];
+        if (!timers.valid()) return;
 
-    // Remove expired non-looping timers
-    for (int id : to_remove) {
-        timers[id] = sol::nil;
-    }
+        // Collect expired timer ids so we can modify the table after iteration
+        std::vector<int> to_remove;
 
-    // ── Process async coroutines ────────────────────────────────────────
-    sol::table coroutines = lua["_mcp_coroutines"];
-    if (!coroutines.valid()) return;
+        timers.for_each([&](const sol::object&, const sol::object& val) {
+            int entry_id = 0;
+            try {
+                if (val.get_type() != sol::type::table) return;
 
-    std::vector<int> co_remove;
+                sol::table entry = val.as<sol::table>();
+                entry_id = entry["id"].get_or(0);
+                float remaining = entry["remaining"].get_or(0.0f);
+                remaining -= delta;
 
-    coroutines.for_each([&](const sol::object& key, const sol::object& val) {
-        if (val.get_type() != sol::type::table) return;
-        sol::table entry = val.as<sol::table>();
-
-        std::string wait_type = entry["wait_type"].get_or<std::string>("none");
-        bool ready = false;
-
-        if (wait_type == "seconds") {
-            float remaining = entry["remaining"].get_or(0.0f);
-            remaining -= delta;
-            if (remaining <= 0.0f) {
-                ready = true;
-            } else {
-                entry["remaining"] = remaining;
-            }
-        } else if (wait_type == "predicate") {
-            sol::optional<sol::protected_function> pred = entry["predicate"];
-            if (pred.has_value()) {
-                auto pred_result = pred.value()();
-                if (pred_result.valid()) {
-                    sol::object r = pred_result;
-                    if (r.get_type() == sol::type::boolean && r.as<bool>()) {
-                        ready = true;
+                if (remaining <= 0.0f) {
+                    sol::optional<sol::protected_function> cb = entry["callback"];
+                    if (cb.has_value()) {
+                        auto result = cb.value()();
+                        if (!result.valid()) {
+                            sol::error err = result;
+                            PipeServer::get().log("LuaEngine: timer callback error: " + std::string(err.what()));
+                        }
                     }
+
+                    bool looping = entry["looping"].get_or(false);
+                    if (looping) {
+                        float delay = entry["delay"].get_or(0.0f);
+                        entry["remaining"] = delay;
+                    } else {
+                        int id = entry["id"].get_or(0);
+                        to_remove.push_back(id);
+                    }
+                } else {
+                    entry["remaining"] = remaining;
+                }
+            } catch (...) {
+                log_current_exception("LuaEngine: timer dispatch exception");
+                if (entry_id != 0) {
+                    to_remove.push_back(entry_id);
                 }
             }
-        } else {
-            // "none" — resume immediately (first tick after mcp.async)
-            ready = true;
+        });
+
+        // Remove expired non-looping timers
+        for (int id : to_remove) {
+            timers[id] = sol::nil;
         }
 
-        if (ready) {
-            sol::optional<sol::thread> thread_opt = entry["thread"];
-            if (!thread_opt.has_value()) {
-                int id = entry["id"].get_or(0);
-                co_remove.push_back(id);
-                return;
-            }
+        // ── Process async coroutines ────────────────────────────────────────
+        sol::table coroutines = lua["_mcp_coroutines"];
+        if (!coroutines.valid()) return;
 
-            sol::thread& thread = thread_opt.value();
-            sol::state_view thread_state = thread.state();
-            sol::object fn_obj = thread_state["_mcp_co_fn"];
-            sol::coroutine co(thread_state.lua_state(), fn_obj);
+        std::vector<int> co_remove;
 
-            if (!co) {
-                int id = entry["id"].get_or(0);
-                co_remove.push_back(id);
-                return;
-            }
+        coroutines.for_each([&](const sol::object&, const sol::object& val) {
+            int entry_id = 0;
+            try {
+                if (val.get_type() != sol::type::table) return;
+                sol::table entry = val.as<sol::table>();
+                entry_id = entry["id"].get_or(0);
 
-            auto result = co();
-            if (!result.valid()) {
-                sol::error err = result;
-                PipeServer::get().log("LuaEngine: coroutine error: " + std::string(err.what()));
-                int id = entry["id"].get_or(0);
-                co_remove.push_back(id);
-                return;
-            }
+                std::string wait_type = entry["wait_type"].get_or<std::string>("none");
+                bool ready = false;
 
-            // Check if coroutine finished
-            auto status = thread.status();
-            if (status == sol::thread_status::dead || status == sol::thread_status::ok) {
-                int id = entry["id"].get_or(0);
-                co_remove.push_back(id);
+                if (wait_type == "seconds") {
+                    float remaining = entry["remaining"].get_or(0.0f);
+                    remaining -= delta;
+                    if (remaining <= 0.0f) {
+                        ready = true;
+                    } else {
+                        entry["remaining"] = remaining;
+                    }
+                } else if (wait_type == "predicate") {
+                    sol::optional<sol::protected_function> pred = entry["predicate"];
+                    if (pred.has_value()) {
+                        auto pred_result = pred.value()();
+                        if (pred_result.valid()) {
+                            sol::object r = pred_result;
+                            if (r.get_type() == sol::type::boolean && r.as<bool>()) {
+                                ready = true;
+                            }
+                        } else {
+                            sol::error err = pred_result;
+                            PipeServer::get().log("LuaEngine: coroutine predicate error: " + std::string(err.what()));
+                        }
+                    }
+                } else {
+                    // "none" — resume immediately (first tick after mcp.async)
+                    ready = true;
+                }
+
+                if (ready) {
+                    sol::optional<sol::thread> thread_opt = entry["thread"];
+                    if (!thread_opt.has_value()) {
+                        int id = entry["id"].get_or(0);
+                        co_remove.push_back(id);
+                        return;
+                    }
+
+                    sol::thread& thread = thread_opt.value();
+                    sol::state_view thread_state = thread.state();
+                    sol::object fn_obj = thread_state["_mcp_co_fn"];
+                    sol::coroutine co(thread_state.lua_state(), fn_obj);
+
+                    if (!co) {
+                        int id = entry["id"].get_or(0);
+                        co_remove.push_back(id);
+                        return;
+                    }
+
+                    auto result = co();
+                    if (!result.valid()) {
+                        sol::error err = result;
+                        PipeServer::get().log("LuaEngine: coroutine error: " + std::string(err.what()));
+                        int id = entry["id"].get_or(0);
+                        co_remove.push_back(id);
+                        return;
+                    }
+
+                    // Check if coroutine finished
+                    auto status = thread.status();
+                    if (status == sol::thread_status::dead || status == sol::thread_status::ok) {
+                        int id = entry["id"].get_or(0);
+                        co_remove.push_back(id);
+                    }
+                    // If yielded, the coroutine set its own wait_type via mcp.wait/wait_until
+                }
+            } catch (...) {
+                log_current_exception("LuaEngine: coroutine dispatch exception");
+                if (entry_id != 0) {
+                    co_remove.push_back(entry_id);
+                }
             }
-            // If yielded, the coroutine set its own wait_type via mcp.wait/wait_until
+        });
+
+        for (int id : co_remove) {
+            coroutines[id] = sol::nil;
         }
-    });
-
-    for (int id : co_remove) {
-        coroutines[id] = sol::nil;
+    } catch (...) {
+        log_current_exception("LuaEngine: on_frame outer exception");
     }
 }
 
@@ -1079,26 +1268,32 @@ json LuaEngine::execute_callback(const std::string& code, const json& context) {
     // Wrap the code to have access to context vars as locals
     std::string wrapped = "local ctx = _callback_ctx\n" + code;
 
-    lua_sethook(lua.lua_state(), instruction_count_hook, LUA_MASKCOUNT, LUA_INSTRUCTION_LIMIT);
-    auto result = lua.safe_script(wrapped, sol::script_pass_on_error);
-    lua_sethook(lua.lua_state(), nullptr, 0, 0);
+    json response;
+    try {
+        LuaInstructionHookGuard hook_guard(lua.lua_state());
+        auto result = lua.safe_script(wrapped, sol::script_pass_on_error);
+
+        if (result.valid()) {
+            sol::object val = result;
+            response["success"] = true;
+            response["result"] = sol_to_json(val);
+        } else {
+            sol::error err = result;
+            response["success"] = false;
+            response["error"] = err.what();
+        }
+    } catch (const std::exception& e) {
+        response["success"] = false;
+        response["error"] = std::string("C++ exception during Lua callback execution: ") + e.what();
+    } catch (...) {
+        response["success"] = false;
+        response["error"] = "Unknown C++ exception during Lua callback execution";
+    }
 
     // Clean up
     lua["_callback_ctx"] = sol::nil;
 
-    json response;
     response["output"] = m_output_buffer;
-
-    if (result.valid()) {
-        sol::object val = result;
-        response["success"] = true;
-        response["result"] = sol_to_json(val);
-    } else {
-        sol::error err = result;
-        response["success"] = false;
-        response["error"] = err.what();
-    }
-
     return response;
 }
 
@@ -1122,24 +1317,30 @@ json LuaEngine::reload_script(const std::string& filepath) {
     m_output_buffer.clear();
     auto& lua = m_state->lua;
 
-    lua_sethook(lua.lua_state(), instruction_count_hook, LUA_MASKCOUNT, LUA_INSTRUCTION_LIMIT);
-    auto result = lua.safe_script(content, sol::script_pass_on_error);
-    lua_sethook(lua.lua_state(), nullptr, 0, 0);
-
     json response;
-    response["output"] = m_output_buffer;
     response["file"] = filepath;
+    try {
+        LuaInstructionHookGuard hook_guard(lua.lua_state());
+        auto result = lua.safe_script(content, sol::script_pass_on_error);
 
-    if (result.valid()) {
-        sol::object val = result;
-        response["success"] = true;
-        response["result"] = sol_to_json(val);
-    } else {
-        sol::error err = result;
+        if (result.valid()) {
+            sol::object val = result;
+            response["success"] = true;
+            response["result"] = sol_to_json(val);
+        } else {
+            sol::error err = result;
+            response["success"] = false;
+            response["error"] = err.what();
+        }
+    } catch (const std::exception& e) {
         response["success"] = false;
-        response["error"] = err.what();
+        response["error"] = std::string("C++ exception during Lua reload: ") + e.what();
+    } catch (...) {
+        response["success"] = false;
+        response["error"] = "Unknown C++ exception during Lua reload";
     }
 
+    response["output"] = m_output_buffer;
     return response;
 }
 

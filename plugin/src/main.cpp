@@ -16,6 +16,20 @@
 
 using namespace uevr;
 
+namespace {
+
+void log_current_exception(const char* context) {
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        PipeServer::get().log(std::string(context) + ": " + e.what());
+    } catch (...) {
+        PipeServer::get().log(std::string(context) + ": unknown C++ exception");
+    }
+}
+
+} // namespace
+
 class UevrMcpPlugin : public uevr::Plugin {
 public:
     UevrMcpPlugin() = default;
@@ -68,22 +82,38 @@ public:
     }
 
     void on_pre_engine_tick(API::UGameEngine* engine, float delta) override {
-        // Process queued game-thread requests
-        GameThreadQueue::get().process_pending(16);
+        try {
+            // Process queued game-thread requests
+            GameThreadQueue::get().process_pending(16);
+        } catch (...) {
+            log_current_exception("UEVR-MCP: on_pre_engine_tick game-thread queue exception");
+        }
 
-        // Run Lua frame callbacks and timers
-        LuaEngine::get().on_frame(delta);
+        try {
+            // Run Lua frame callbacks and timers
+            LuaEngine::get().on_frame(delta);
+        } catch (...) {
+            log_current_exception("UEVR-MCP: on_pre_engine_tick Lua exception");
+        }
 
-        // Process property watches
-        PropertyWatch::get().tick(StatusRoutes::get_tick_count());
+        try {
+            // Process property watches
+            PropertyWatch::get().tick(StatusRoutes::get_tick_count());
+        } catch (...) {
+            log_current_exception("UEVR-MCP: on_pre_engine_tick property watch exception");
+        }
 
         // Track tick count for status
         StatusRoutes::increment_tick_count();
     }
 
     void on_present() override {
-        // Screenshot capture from D3D backbuffer
-        ScreenshotCapture::get().on_present();
+        try {
+            // Screenshot capture from D3D backbuffer
+            ScreenshotCapture::get().on_present();
+        } catch (...) {
+            log_current_exception("UEVR-MCP: on_present exception");
+        }
     }
 
     void on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE* state) override {

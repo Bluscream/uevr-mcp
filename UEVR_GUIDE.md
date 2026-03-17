@@ -758,6 +758,42 @@ uevr_objects_by_class("/Script/Engine.StaticMeshActor")
 uevr_objects_by_class("/Script/Engine.PointLight")
 ```
 
+### RoboQuest: Load Basecamp
+
+Use the direct travel command when you need a reliable jump to Basecamp from anywhere, including the title screen:
+
+```
+uevr_exec_command("open /Game/Maps/Basecamp")
+```
+
+For a cleaner in-game return path, call the gameplay controller's `ReturnToBasecamp()` method while already inside a run:
+
+```
+uevr_exec_command("open /Game/Maps/LevelGenerator")   # example run map
+uevr_get_player                                       # get BP_IngamePlayerController_C
+uevr_invoke_method(controller_addr, "ReturnToBasecamp")
+```
+
+Notes:
+- `RQBlueprintLibrary.GetBasecampMapName()` resolves to `/Game/Maps/Basecamp`.
+- `ReturnToBasecamp()` works on `BP_IngamePlayerController_C` and transitions back to `World /Game/Maps/Basecamp.Basecamp`.
+- On the title map, `ReturnToBasecamp()` on `BP_TitlePlayerController_C` was a no-op, and `OnBlueprintStartSoloGame()` returned `MapName=None`, so prefer the `open /Game/Maps/Basecamp` command there.
+
+### RoboQuest: Skip The "Press Any Key To Continue" Loading Gate
+
+When RoboQuest is sitting on the canyon loading screen with the "press any key to continue" prompt, the reliable bypass is to invoke the gameplay controller's `OnPressedAnyKey()` method directly instead of trying to post keyboard or gamepad input.
+
+```
+uevr_get_player                                       # controller should be BP_IngamePlayerController_C
+uevr_invoke_method(controller_addr, "OnPressedAnyKey")
+```
+
+Notes:
+- This was verified live while the screen was showing the canyon loading art and blocking progression.
+- The active loading widget was `WGT_LoadingScreen_C`, but calling `OnPressedAnyKey()` on `BP_IngamePlayerController_C` was enough to dismiss it and return to the world view.
+- Desktop screenshots were more reliable than the plugin backbuffer screenshot route for confirming the transition.
+- If a future load lands on the same screen again, call `OnPressedAnyKey()` first before trying raw `uevr_input_key` or `uevr_input_gamepad`.
+
 ---
 
 ## Appendix: Property Type Mapping

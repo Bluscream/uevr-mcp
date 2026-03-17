@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <unordered_map>
 #include <thread>
@@ -135,6 +136,39 @@ static void send_json(httplib::Response& res, const json& data, int status = 200
     res.set_content(data.dump(2), "application/json");
 }
 
+static int get_duration_ms(const json& body, int default_ms, bool seconds_input = false) {
+    auto it = body.find("duration");
+    if (it == body.end() || it->is_null()) {
+        return default_ms;
+    }
+
+    double raw = 0.0;
+    if (it->is_number_integer() || it->is_number_unsigned()) {
+        raw = static_cast<double>(it->get<int>());
+    } else if (it->is_number_float()) {
+        raw = it->get<double>();
+    } else {
+        return default_ms;
+    }
+
+    if (seconds_input) {
+        raw *= 1000.0;
+    }
+
+    const auto duration_ms = static_cast<int>(std::lround(raw));
+    return duration_ms < 0 ? 0 : duration_ms;
+}
+
+static bool try_get_float(const json& body, const char* key, float& out) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null() || !it->is_number()) {
+        return false;
+    }
+
+    out = it->get<float>();
+    return true;
+}
+
 void register_routes(httplib::Server& server) {
 
     // POST /api/input/key — Simulate a keyboard key press/release
@@ -173,7 +207,7 @@ void register_routes(httplib::Server& server) {
         } else { // "tap" — press then release
             PostMessageA(hwnd, WM_KEYDOWN, static_cast<WPARAM>(vk), make_key_lparam(vk, false));
             // Small delay between press and release
-            std::this_thread::sleep_for(std::chrono::milliseconds(body.value("duration", 50)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(get_duration_ms(body, 50)));
             PostMessageA(hwnd, WM_KEYUP, static_cast<WPARAM>(vk), make_key_lparam(vk, true));
         }
 
@@ -248,7 +282,7 @@ void register_routes(httplib::Server& server) {
             PostMessageA(hwnd, msg_up, 0, lp);
         } else { // "click"
             PostMessageA(hwnd, msg_down, wp, lp);
-            std::this_thread::sleep_for(std::chrono::milliseconds(body.value("duration", 50)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(get_duration_ms(body, 50)));
             PostMessageA(hwnd, msg_up, 0, lp);
         }
 
@@ -318,12 +352,14 @@ void register_routes(httplib::Server& server) {
         }
 
         // Triggers (0.0 to 1.0)
-        if (body.contains("leftTrigger")) {
-            float lt = std::clamp(body["leftTrigger"].get<float>(), 0.0f, 1.0f);
+        float lt = 0.0f;
+        if (try_get_float(body, "leftTrigger", lt)) {
+            lt = std::clamp(lt, 0.0f, 1.0f);
             pad.bLeftTrigger = static_cast<BYTE>(lt * 255.0f);
         }
-        if (body.contains("rightTrigger")) {
-            float rt = std::clamp(body["rightTrigger"].get<float>(), 0.0f, 1.0f);
+        float rt = 0.0f;
+        if (try_get_float(body, "rightTrigger", rt)) {
+            rt = std::clamp(rt, 0.0f, 1.0f);
             pad.bRightTrigger = static_cast<BYTE>(rt * 255.0f);
         }
 
@@ -331,7 +367,7 @@ void register_routes(httplib::Server& server) {
         gp.active.store(true, std::memory_order_release);
 
         // If duration is specified, schedule deactivation
-        int duration_ms = body.value("duration", 0);
+        int duration_ms = get_duration_ms(body, 0, true);
         if (duration_ms > 0) {
             std::thread([duration_ms]() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
