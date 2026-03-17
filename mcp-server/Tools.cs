@@ -4,6 +4,27 @@ using ModelContextProtocol.Server;
 
 namespace UevrMcp;
 
+static class JsonArgs
+{
+    public static object? Parse(string? text)
+    {
+        if (text is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            return doc.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            return text;
+        }
+    }
+}
+
 // ── Pipe tools (always available, even without HTTP) ────────────────
 
 [McpServerToolType]
@@ -176,22 +197,22 @@ public static class ExplorerWriteTools
     public static async Task<string> WriteField(
         [Description("Object address (0xHEX)")] string address,
         [Description("Field name to write")] string fieldName,
-        [Description("New value (JSON: number, bool, string, or object)")] JsonElement value)
-        => await Http.Post("/api/explorer/field", new { address, fieldName, value });
+        [Description("New value (JSON: number, bool, string, or object)")] string value)
+        => await Http.Post("/api/explorer/field", new { address, fieldName, value = JsonArgs.Parse(value) });
 
     [McpServerTool(Name = "uevr_invoke_method")]
     [Description("Call a UFunction with arguments on an object. Pass args as a JSON object with parameter names as keys, or as a JSON array for positional args.")]
     public static async Task<string> InvokeMethod(
         [Description("Object address (0xHEX)")] string address,
         [Description("Method name")] string methodName,
-        [Description("Arguments as JSON object {paramName: value} or array [value1, value2]")] JsonElement? args = null)
-        => await Http.Post("/api/explorer/method", new { address, methodName, args });
+        [Description("Arguments as JSON object {paramName: value} or array [value1, value2]")] string? args = null)
+        => await Http.Post("/api/explorer/method", new { address, methodName, args = JsonArgs.Parse(args) });
 
     [McpServerTool(Name = "uevr_batch")]
     [Description("Execute multiple operations in one game-thread request. Each operation has a 'type' (read_field, write_field, inspect, call_method, search) and type-specific params. Errors in one operation don't abort others.")]
     public static async Task<string> Batch(
-        [Description("Array of operations: [{type, address?, fieldName?, value?, methodName?, args?, query?, limit?, depth?}]")] JsonElement operations)
-        => await Http.Post("/api/explorer/batch", new { operations });
+        [Description("Array of operations: [{type, address?, fieldName?, value?, methodName?, args?, query?, limit?, depth?}]")] string operations)
+        => await Http.Post("/api/explorer/batch", new { operations = JsonArgs.Parse(operations) });
 }
 
 // ── Console tools ───────────────────────────────────────────────────
@@ -216,8 +237,8 @@ public static class ConsoleTools
     [Description("Set a console variable's value.")]
     public static async Task<string> SetCvar(
         [Description("CVar name")] string name,
-        [Description("New value (number or string)")] JsonElement value)
-        => await Http.Post("/api/console/cvar", new { name, value });
+        [Description("New value (number or string)")] string value)
+        => await Http.Post("/api/console/cvar", new { name, value = JsonArgs.Parse(value) });
 
     [McpServerTool(Name = "uevr_exec_command")]
     [Description("Execute an Unreal Engine console command (e.g. 'stat fps', 'show collision').")]
@@ -249,8 +270,8 @@ public static class VrTools
     [McpServerTool(Name = "uevr_set_vr_setting")]
     [Description("Change a VR setting. Supports named settings (snapTurnEnabled, decoupledPitchEnabled, aimMethod, aimAllowed) or arbitrary mod values via key/value.")]
     public static async Task<string> SetVrSetting(
-        [Description("Setting to change: snapTurnEnabled (bool), decoupledPitchEnabled (bool), aimMethod (int: 0=Game, 1=Head, 2=Right, 3=Left), aimAllowed (bool), or key+value for arbitrary mod values")] JsonElement settings)
-        => await Http.Post("/api/vr/settings", settings);
+        [Description("Setting to change: snapTurnEnabled (bool), decoupledPitchEnabled (bool), aimMethod (int: 0=Game, 1=Head, 2=Right, 3=Left), aimAllowed (bool), or key+value for arbitrary mod values")] string settings)
+        => await Http.Post("/api/vr/settings", JsonArgs.Parse(settings) ?? new { });
 
     [McpServerTool(Name = "uevr_recenter")]
     [Description("Recenter the VR view to the current head position.")]
@@ -304,8 +325,8 @@ public static class PlayerTools
     [McpServerTool(Name = "uevr_set_health")]
     [Description("Set the player's health. Searches common field names (Health, CurrentHealth, HP, etc.) on the pawn and its components.")]
     public static async Task<string> SetHealth(
-        [Description("New health value")] JsonElement value)
-        => await Http.Post("/api/player/health", new { value });
+        [Description("New health value")] string value)
+        => await Http.Post("/api/player/health", new { value = JsonArgs.Parse(value) });
 }
 
 // ── Explorer advanced tools ─────────────────────────────────────────
@@ -317,8 +338,8 @@ public static class ExplorerAdvancedTools
     [Description("Multi-step object graph traversal. Navigate from a starting object through fields, methods, arrays, filters, and collect results — all in one request. Replaces 5-10 sequential calls. Steps: 'field' (follow ObjectProperty), 'method' (call getter, follow result), 'array' (expand array field elements), 'filter' (keep objects matching condition), 'collect' (terminal: read fields/methods from all objects).")]
     public static async Task<string> Chain(
         [Description("Starting object address (0xHEX)")] string address,
-        [Description("Array of steps: [{type:'field',name:'X'}, {type:'method',name:'GetY'}, {type:'array',name:'Items'}, {type:'filter',method:'IsAlive'}, {type:'collect',fields:['Name'],methods:['GetHP']}]")] JsonElement steps)
-        => await Http.Post("/api/explorer/chain", new { address, steps });
+        [Description("Array of steps: [{type:'field',name:'X'}, {type:'method',name:'GetY'}, {type:'array',name:'Items'}, {type:'filter',method:'IsAlive'}, {type:'collect',fields:['Name'],methods:['GetHP']}]")] string steps)
+        => await Http.Post("/api/explorer/chain", new { address, steps = JsonArgs.Parse(steps) });
 
     [McpServerTool(Name = "uevr_get_singletons")]
     [Description("List commonly-used singleton objects: GameEngine, GameInstance, PlayerController, Pawn, World, GameMode, GameState, etc. Great starting point for exploring game state.")]
@@ -506,8 +527,8 @@ public static class BlueprintTools
     public static async Task<string> WriteCdo(
         [Description("Class path")] string className,
         [Description("Field name to write")] string fieldName,
-        [Description("New value (JSON)")] JsonElement value)
-        => await Http.Post("/api/blueprint/cdo", new { className, fieldName, value });
+        [Description("New value (JSON)")] string value)
+        => await Http.Post("/api/blueprint/cdo", new { className, fieldName, value = JsonArgs.Parse(value) });
 
     [McpServerTool(Name = "uevr_destroy_object")]
     [Description("Destroy an actor by calling K2_DestroyActor. Removes it from the world and the MCP spawn tracker.")]
@@ -519,10 +540,15 @@ public static class BlueprintTools
     [Description("Set an actor's world transform: location, rotation, and/or scale. All components are optional — omit to keep current value.")]
     public static async Task<string> SetTransform(
         [Description("Actor address (0xHEX)")] string address,
-        [Description("Location as {x, y, z}")] JsonElement? location = null,
-        [Description("Rotation as {pitch, yaw, roll}")] JsonElement? rotation = null,
-        [Description("Scale as {x, y, z}")] JsonElement? scale = null)
-        => await Http.Post("/api/blueprint/set_transform", new { address, location, rotation, scale });
+        [Description("Location as {x, y, z}")] string? location = null,
+        [Description("Rotation as {pitch, yaw, roll}")] string? rotation = null,
+        [Description("Scale as {x, y, z}")] string? scale = null)
+        => await Http.Post("/api/blueprint/set_transform", new {
+            address,
+            location = JsonArgs.Parse(location),
+            rotation = JsonArgs.Parse(rotation),
+            scale = JsonArgs.Parse(scale)
+        });
 
     [McpServerTool(Name = "uevr_list_spawned")]
     [Description("List all objects spawned through MCP with alive/dead status.")]
@@ -635,18 +661,23 @@ public static class WorldTools
     [McpServerTool(Name = "uevr_line_trace")]
     [Description("Perform a line trace (raycast) in the world. Returns hit location, normal, distance, and the actor/component that was hit.")]
     public static async Task<string> LineTrace(
-        [Description("Start point {x, y, z}")] JsonElement start,
-        [Description("End point {x, y, z}")] JsonElement end,
+        [Description("Start point {x, y, z}")] string start,
+        [Description("End point {x, y, z}")] string end,
         [Description("Trace channel (default 0 = Visibility)")] int? channel = null,
         [Description("Use complex collision (default false)")] bool? complex = null)
-        => await Http.Post("/api/world/line_trace", new { start, end, channel, complex });
+        => await Http.Post("/api/world/line_trace", new {
+            start = JsonArgs.Parse(start),
+            end = JsonArgs.Parse(end),
+            channel,
+            complex
+        });
 
     [McpServerTool(Name = "uevr_sphere_overlap")]
     [Description("Find all actors within a sphere. Returns overlapping actors with addresses and classes.")]
     public static async Task<string> SphereOverlap(
-        [Description("Center point {x, y, z}")] JsonElement center,
+        [Description("Center point {x, y, z}")] string center,
         [Description("Sphere radius")] float radius)
-        => await Http.Post("/api/world/sphere_overlap", new { center, radius });
+        => await Http.Post("/api/world/sphere_overlap", new { center = JsonArgs.Parse(center), radius });
 
     [McpServerTool(Name = "uevr_hierarchy")]
     [Description("Get the parent/child hierarchy of an object: outer chain, owner, attachment parent/children, and class super chain.")]
@@ -672,19 +703,26 @@ public static class InputTools
     public static async Task<string> InputMouse(
         [Description("Button: 'left', 'right', 'middle' (for clicks)")] string? button = null,
         [Description("Event: 'press', 'release', 'click' (default 'click')")] string? eventType = null,
-        [Description("Mouse position/movement as {x, y}")] JsonElement? move = null)
-        => await Http.Post("/api/input/mouse", new { button, @event = eventType, move });
+        [Description("Mouse position/movement as {x, y}")] string? move = null)
+        => await Http.Post("/api/input/mouse", new { button, @event = eventType, move = JsonArgs.Parse(move) });
 
     [McpServerTool(Name = "uevr_input_gamepad")]
     [Description("Simulate gamepad input (buttons, sticks, triggers). Overrides XInput state until cleared.")]
     public static async Task<string> InputGamepad(
-        [Description("Buttons as {a?, b?, x?, y?, lb?, rb?, start?, back?, ...}")] JsonElement? buttons = null,
-        [Description("Left stick as {x, y} (-1.0 to 1.0)")] JsonElement? leftStick = null,
-        [Description("Right stick as {x, y} (-1.0 to 1.0)")] JsonElement? rightStick = null,
+        [Description("Buttons as {a?, b?, x?, y?, lb?, rb?, start?, back?, ...}")] string? buttons = null,
+        [Description("Left stick as {x, y} (-1.0 to 1.0)")] string? leftStick = null,
+        [Description("Right stick as {x, y} (-1.0 to 1.0)")] string? rightStick = null,
         [Description("Left trigger (0.0 to 1.0)")] float? leftTrigger = null,
         [Description("Right trigger (0.0 to 1.0)")] float? rightTrigger = null,
         [Description("Duration in seconds before auto-clearing (0 = until manual clear)")] float? duration = null)
-        => await Http.Post("/api/input/gamepad", new { buttons, leftStick, rightStick, leftTrigger, rightTrigger, duration });
+        => await Http.Post("/api/input/gamepad", new {
+            buttons = JsonArgs.Parse(buttons),
+            leftStick = JsonArgs.Parse(leftStick),
+            rightStick = JsonArgs.Parse(rightStick),
+            leftTrigger,
+            rightTrigger,
+            duration
+        });
 
     [McpServerTool(Name = "uevr_input_text")]
     [Description("Type a string of text by sending character messages to the game window.")]
@@ -718,8 +756,8 @@ public static class MaterialTools
     public static async Task<string> SetVector(
         [Description("MaterialInstanceDynamic address (0xHEX)")] string address,
         [Description("Parameter name")] string paramName,
-        [Description("Color/vector value as {r, g, b, a}")] JsonElement value)
-        => await Http.Post("/api/material/set_vector", new { address, paramName, value });
+        [Description("Color/vector value as {r, g, b, a}")] string value)
+        => await Http.Post("/api/material/set_vector", new { address, paramName, value = JsonArgs.Parse(value) });
 
     [McpServerTool(Name = "uevr_material_params")]
     [Description("Get the parameter list of a material (scalar, vector, and texture parameters).")]
@@ -768,8 +806,8 @@ public static class AnimationTools
     public static async Task<string> SetVariable(
         [Description("SkeletalMeshComponent address (0xHEX)")] string meshAddress,
         [Description("Variable name")] string varName,
-        [Description("New value")] JsonElement value)
-        => await Http.Post("/api/animation/set_variable", new { meshAddress, varName, value });
+        [Description("New value")] string value)
+        => await Http.Post("/api/animation/set_variable", new { meshAddress, varName, value = JsonArgs.Parse(value) });
 
     [McpServerTool(Name = "uevr_animation_montages")]
     [Description("List available animation montages loaded in memory.")]
@@ -788,16 +826,16 @@ public static class PhysicsTools
     [Description("Add an impulse to a primitive component (instant force). Great for launching objects, knockback effects.")]
     public static async Task<string> AddImpulse(
         [Description("PrimitiveComponent address (0xHEX)")] string address,
-        [Description("Impulse vector {x, y, z}")] JsonElement impulse,
+        [Description("Impulse vector {x, y, z}")] string impulse,
         [Description("Treat as velocity change instead of force (default false)")] bool? velocityChange = null)
-        => await Http.Post("/api/physics/add_impulse", new { address, impulse, velocityChange });
+        => await Http.Post("/api/physics/add_impulse", new { address, impulse = JsonArgs.Parse(impulse), velocityChange });
 
     [McpServerTool(Name = "uevr_physics_add_force")]
     [Description("Add a continuous force to a primitive component. Force persists for one frame.")]
     public static async Task<string> AddForce(
         [Description("PrimitiveComponent address (0xHEX)")] string address,
-        [Description("Force vector {x, y, z}")] JsonElement force)
-        => await Http.Post("/api/physics/add_force", new { address, force });
+        [Description("Force vector {x, y, z}")] string force)
+        => await Http.Post("/api/physics/add_force", new { address, force = JsonArgs.Parse(force) });
 
     [McpServerTool(Name = "uevr_physics_set_simulate")]
     [Description("Enable or disable physics simulation on a component.")]
@@ -915,16 +953,16 @@ public static class MacroTools
     [Description("Save a reusable macro — a named sequence of operations (same format as batch). Use $paramName placeholders for parameterized values. Macros persist to disk across game restarts.")]
     public static async Task<string> MacroSave(
         [Description("Macro name")] string name,
-        [Description("Array of operations (batch format)")] JsonElement operations,
+        [Description("Array of operations (batch format)")] string operations,
         [Description("Optional description")] string? description = null)
-        => await Http.Post("/api/macro/save", new { name, operations, description });
+        => await Http.Post("/api/macro/save", new { name, operations = JsonArgs.Parse(operations), description });
 
     [McpServerTool(Name = "uevr_macro_play")]
     [Description("Execute a saved macro with state propagation. Pass params to substitute $placeholders. Use $result[N].field to reference previous operation results (e.g. $result[0].address uses the address from the first operation's result).")]
     public static async Task<string> MacroPlay(
         [Description("Macro name")] string name,
-        [Description("Parameters to substitute (e.g. {address: '0x...'})")] JsonElement? @params = null)
-        => await Http.Post("/api/macro/play", new { name, @params });
+        [Description("Parameters to substitute (e.g. {address: '0x...'})")] string? @params = null)
+        => await Http.Post("/api/macro/play", new { name, @params = JsonArgs.Parse(@params) });
 
     [McpServerTool(Name = "uevr_macro_list")]
     [Description("List all saved macros with names and operation counts.")]
