@@ -677,6 +677,62 @@ class TestLuaTimers:
                           json={"code": "mcp.clear_all_timers()"}, timeout=10)
 
 
+class TestLuaAsync:
+    """Test mcp.async(), mcp.wait(), and mcp.wait_until()."""
+
+    def test_async_wait_and_wait_until_complete(self, require_game, api_url):
+        """Async coroutines resume after wait() and wait_until() and finish cleanly."""
+        setup_code = """
+        mcp.clear_all_timers()
+        mcp.clear_async()
+        _async_phase = "cold"
+        _async_timer_hits = 0
+        _async_resumes = 0
+
+        mcp.set_timer(0.05, function()
+            _async_timer_hits = _async_timer_hits + 1
+        end, true)
+
+        mcp.async(function()
+            _async_resumes = _async_resumes + 1
+            _async_phase = "after_spawn"
+            mcp.wait(0.10)
+
+            _async_resumes = _async_resumes + 1
+            _async_phase = "after_wait"
+            mcp.wait_until(function()
+                return _async_timer_hits >= 2
+            end)
+
+            _async_resumes = _async_resumes + 1
+            _async_phase = "complete"
+        end)
+        """
+
+        try:
+            r = requests.post(f"{api_url}/api/lua/exec", json={"code": setup_code}, timeout=10)
+            assert r.json()["success"] is True
+
+            time.sleep(0.5)
+
+            result_r = requests.post(f"{api_url}/api/lua/exec", json={
+                "code": "return {phase = _async_phase, timer_hits = _async_timer_hits, resumes = _async_resumes}"
+            }, timeout=10)
+            data = result_r.json()
+            assert data["success"] is True
+            assert data["result"]["phase"] == "complete"
+            assert data["result"]["timer_hits"] >= 2
+            assert data["result"]["resumes"] == 3
+
+            state_r = requests.get(f"{api_url}/api/lua/state", timeout=5)
+            state = state_r.json()
+            assert state["coroutineCount"] == 0
+            assert state["timerCount"] == 1
+        finally:
+            requests.post(f"{api_url}/api/lua/exec",
+                          json={"code": "mcp.clear_all_timers(); mcp.clear_async()"}, timeout=10)
+
+
 class TestLuaReset:
     """Test POST /api/lua/reset — Reset Lua state."""
 

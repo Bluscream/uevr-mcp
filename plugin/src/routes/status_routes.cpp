@@ -6,17 +6,65 @@
 #include "../reflection/property_reader.h"
 #include "../reflection/property_writer.h"
 #include "../reflection/function_caller.h"
+#include "../http_server.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <uevr/API.hpp>
 #include <chrono>
+#include <cmath>
 
 using json = nlohmann::json;
 
 namespace StatusRoutes {
 
 static std::atomic<uint64_t> s_tick_count{0};
+
+static json get_actor_location(uevr::API::UObject* actor) {
+    if (actor == nullptr) {
+        return json{{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
+    }
+
+    auto* cls = actor->get_class();
+    if (cls == nullptr) {
+        return json{{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
+    }
+
+    auto* get_func = cls->find_function(L"K2_GetActorLocation");
+    if (get_func == nullptr) {
+        get_func = cls->find_function(L"GetActorLocation");
+    }
+
+    if (get_func == nullptr) {
+        return json{{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
+    }
+
+    auto ps = get_func->get_properties_size();
+    auto ma = get_func->get_min_alignment();
+    std::vector<uint8_t> params;
+    if (ma > 1) {
+        params.resize(((ps + ma - 1) / ma) * ma, 0);
+    } else {
+        params.resize(ps, 0);
+    }
+
+    actor->process_event(get_func, params.data());
+
+    for (auto p = get_func->get_child_properties(); p; p = p->get_next()) {
+        auto* fp = reinterpret_cast<uevr::API::FProperty*>(p);
+        if (fp->is_return_param()) {
+            return PropertyReader::read_property(params.data(), fp, 2);
+        }
+    }
+
+    return json{{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
+}
+
+static bool location_matches(const json& actual, double x, double y, double z, double tolerance = 2.0) {
+    return std::abs(actual.value("x", 0.0) - x) <= tolerance
+        && std::abs(actual.value("y", 0.0) - y) <= tolerance
+        && std::abs(actual.value("z", 0.0) - z) <= tolerance;
+}
 
 void increment_tick_count() {
     s_tick_count.fetch_add(1, std::memory_order_relaxed);
@@ -198,7 +246,7 @@ void register_routes(httplib::Server& server) {
         auto& pipe = PipeServer::get();
         auto elapsed = std::chrono::steady_clock::now() - pipe.start_time();
         result["uptimeSeconds"] = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
-        result["httpPort"] = 8899;
+        result["httpPort"] = HttpServer::get().port();
 
         res.set_content(result.dump(2), "application/json");
     });
@@ -229,28 +277,7 @@ void register_routes(httplib::Server& server) {
             if (!func) func = cls->find_function(L"SetActorLocation");
 
             if (func) {
-                // First, get current location via K2_GetActorLocation
-                auto get_func = cls->find_function(L"K2_GetActorLocation");
-                if (!get_func) get_func = cls->find_function(L"GetActorLocation");
-
-                json current_pos = {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
-                if (get_func) {
-                    auto ps = get_func->get_properties_size();
-                    auto ma = get_func->get_min_alignment();
-                    std::vector<uint8_t> params;
-                    if (ma > 1) params.resize(((ps + ma - 1) / ma) * ma, 0);
-                    else params.resize(ps, 0);
-
-                    pawn->process_event(get_func, params.data());
-
-                    for (auto p = get_func->get_child_properties(); p; p = p->get_next()) {
-                        auto fp = reinterpret_cast<uevr::API::FProperty*>(p);
-                        if (fp->is_return_param()) {
-                            current_pos = PropertyReader::read_property(params.data(), fp, 2);
-                            break;
-                        }
-                    }
-                }
+                json current_pos = get_actor_location(pawn);
 
                 // Apply partial update
                 double x = body.contains("x") ? body["x"].get<double>() : current_pos.value("x", 0.0);
@@ -269,18 +296,43 @@ void register_routes(httplib::Server& server) {
                     args
                 );
 
-                if (invoke_result.contains("error")) {
+                json actual_pos = get_actor_location(pawn);
+                bool moved = location_matches(actual_pos, x, y, z);
+
+                if (invoke_result.contains("error") || !moved) {
                     // Fallback: try TeleportTo
                     json tp_args;
                     tp_args["DestLocation"] = {{"x", x}, {"y", y}, {"z", z}};
+                    auto rotation_result = FunctionCaller::call_getter(reinterpret_cast<uintptr_t>(pawn), "K2_GetActorRotation");
+                    json default_rotation{{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
+                    tp_args["DestRotation"] = rotation_result.contains("result")
+                        ? rotation_result["result"]
+                        : default_rotation;
                     invoke_result = FunctionCaller::invoke_function(
                         reinterpret_cast<uintptr_t>(pawn),
                         "K2_TeleportTo",
                         tp_args
                     );
+                    actual_pos = get_actor_location(pawn);
+                    moved = location_matches(actual_pos, x, y, z);
                 }
 
-                return json{{"success", true}, {"position", {{"x", x}, {"y", y}, {"z", z}}}};
+                json result{
+                    {"requestedPosition", {{"x", x}, {"y", y}, {"z", z}}},
+                    {"previousPosition", current_pos},
+                    {"actualPosition", actual_pos},
+                    {"success", moved}
+                };
+
+                if (invoke_result.contains("error")) {
+                    result["invokeResult"] = invoke_result;
+                }
+
+                if (!moved) {
+                    result["warning"] = "Pawn did not reach requested position";
+                }
+
+                return result;
             }
 
             return json{{"error", "Could not find SetActorLocation or K2_SetActorLocation function"}};

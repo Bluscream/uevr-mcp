@@ -26,6 +26,38 @@ static void send_json(httplib::Response& res, const json& data, int status = 200
     res.set_content(data.dump(2), "application/json");
 }
 
+static bool require_object_body(const json& body, httplib::Response& res) {
+    if (!body.is_object()) {
+        send_json(res, json{{"error", "JSON body must be an object"}}, 400);
+        return false;
+    }
+    return true;
+}
+
+static int read_int_or(const json& body, const char* key, int fallback) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) {
+        return fallback;
+    }
+    return it->get<int>();
+}
+
+static float read_float_or(const json& body, const char* key, float fallback) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) {
+        return fallback;
+    }
+    return it->get<float>();
+}
+
+static bool read_bool_or(const json& body, const char* key, bool fallback) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) {
+        return fallback;
+    }
+    return it->get<bool>();
+}
+
 void register_routes(httplib::Server& server) {
 
     // GET /api/world/actors — List actors in the current world
@@ -224,6 +256,9 @@ void register_routes(httplib::Server& server) {
             send_json(res, json{{"error", "Invalid JSON body"}}, 400);
             return;
         }
+        if (!require_object_body(body, res)) {
+            return;
+        }
 
         if (!body.contains("start") || !body.contains("end")) {
             send_json(res, json{{"error", "Missing 'start' or 'end' vectors"}}, 400);
@@ -260,13 +295,18 @@ void register_routes(httplib::Server& server) {
             args["WorldContextObject"] = JsonHelpers::address_to_string(pawn);
             args["Start"] = body["start"];
             args["End"] = body["end"];
-            args["TraceChannel"] = body.value("channel", 0); // ECC_Visibility = 0
-            args["bTraceComplex"] = body.value("complex", false);
-            args["ActorsToIgnore"] = json::array();
+            args["TraceChannel"] = read_int_or(body, "channel", 0); // ECC_Visibility = 0
+            args["bTraceComplex"] = read_bool_or(body, "complex", false);
             args["DrawDebugType"] = 0; // None
             args["bIgnoreSelf"] = true;
 
             auto invoke_result = FunctionCaller::invoke_function(cdo_addr, "LineTraceSingleByChannel", args);
+            if (invoke_result.contains("error")) {
+                auto err = invoke_result["error"].get<std::string>();
+                if (err.find("not found") != std::string::npos) {
+                    invoke_result = FunctionCaller::invoke_function(cdo_addr, "LineTraceSingle", args);
+                }
+            }
 
             if (invoke_result.contains("error")) {
                 return invoke_result;
@@ -274,15 +314,19 @@ void register_routes(httplib::Server& server) {
 
             // Parse out the hit result
             json response;
-            if (invoke_result.contains("ReturnValue")) {
+            if (invoke_result.contains("ReturnValue") && invoke_result["ReturnValue"].is_boolean()) {
                 response["hit"] = invoke_result["ReturnValue"].get<bool>();
+            } else if (invoke_result.contains("result") && invoke_result["result"].is_boolean()) {
+                response["hit"] = invoke_result["result"].get<bool>();
             } else {
                 response["hit"] = false;
             }
 
             // Try to extract HitResult out-param data
-            if (invoke_result.contains("OutHitResult") || invoke_result.contains("HitResult")) {
-                auto& hit = invoke_result.contains("OutHitResult") ? invoke_result["OutHitResult"] : invoke_result["HitResult"];
+            if (invoke_result.contains("OutHitResult") || invoke_result.contains("HitResult") || invoke_result.contains("OutHit")) {
+                auto& hit = invoke_result.contains("OutHitResult")
+                    ? invoke_result["OutHitResult"]
+                    : (invoke_result.contains("HitResult") ? invoke_result["HitResult"] : invoke_result["OutHit"]);
                 if (hit.is_object()) {
                     if (hit.contains("Location")) response["location"] = hit["Location"];
                     if (hit.contains("ImpactPoint")) response["location"] = hit["ImpactPoint"];
@@ -310,6 +354,9 @@ void register_routes(httplib::Server& server) {
         json body;
         try { body = json::parse(req.body); } catch (...) {
             send_json(res, json{{"error", "Invalid JSON body"}}, 400);
+            return;
+        }
+        if (!require_object_body(body, res)) {
             return;
         }
 
@@ -345,7 +392,7 @@ void register_routes(httplib::Server& server) {
             json args;
             args["WorldContextObject"] = JsonHelpers::address_to_string(pawn);
             args["SpherePos"] = body["center"];
-            args["SphereRadius"] = body["radius"].get<float>();
+            args["SphereRadius"] = read_float_or(body, "radius", 0.0f);
 
             // ObjectTypes — array of object type queries. Use WorldDynamic + WorldStatic + Pawn by default
             if (body.contains("objectTypes")) {

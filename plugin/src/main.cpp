@@ -63,12 +63,13 @@ public:
         pipe.log("Plugin initializing for " + game_name);
         Diagnostics::get().initialize();
 
-        // Start HTTP server
+        // Start HTTP server (tries port 8899, falls back to next available)
         auto& http = HttpServer::get();
         if (http.start(8899)) {
-            pipe.log("HTTP server started on port 8899");
+            pipe.set_http_port(http.port());
+            pipe.log("HTTP server started on port " + std::to_string(http.port()));
         } else {
-            API::get()->log_error("UEVR-MCP: Failed to start HTTP server");
+            API::get()->log_error("UEVR-MCP: Failed to start HTTP server on any port");
             pipe.log("ERROR: HTTP server failed to start");
         }
 

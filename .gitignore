@@ -1,11 +1,15 @@
 # Build outputs
 plugin/build/
+plugin/build_maponly/
 **/bin/
 **/obj/
 
-# Dependencies (downloaded at build time)
-plugin/dependencies/cpp-httplib/
-plugin/dependencies/nlohmann/
+# Test / scratch artifacts
+artifacts/
+scratch_disasm.txt
+CRASH_REPORT.md
+
+# Vendored header-only deps (cpp-httplib, nlohmann) are tracked in plugin/dependencies/
 
 # IDE
 .vs/

@@ -132,6 +132,8 @@ json PipeServer::handle_request(const json& request) {
         result["uptime_seconds"] = seconds;
         result["game"] = m_game_name;
         result["queue_depth"] = GameThreadQueue::get().pending_count();
+        auto port = m_http_port.load();
+        if (port > 0) result["http_port"] = port;
 
         if (api) {
             auto vr = api->param()->vr;
@@ -140,6 +142,14 @@ json PipeServer::handle_request(const json& request) {
         }
 
         return result;
+    }
+
+    if (cmd == "get_http_port") {
+        auto port = m_http_port.load();
+        if (port > 0) {
+            return json{{"http_port", port}};
+        }
+        return json{{"error", "HTTP server not started"}};
     }
 
     if (cmd == "get_log") {

@@ -83,6 +83,15 @@ json invoke_function(uintptr_t address, const std::string& method_name, const js
         return json{{"error", "Method '" + method_name + "' not found"}};
     }
 
+    json normalized_args = args;
+    if (normalized_args.is_string()) {
+        try {
+            normalized_args = json::parse(normalized_args.get<std::string>());
+        } catch (const std::exception& e) {
+            return json{{"error", "Invalid JSON in args string: " + std::string(e.what())}};
+        }
+    }
+
     // Allocate params buffer
     auto ps = func->get_properties_size();
     auto ma = func->get_min_alignment();
@@ -122,10 +131,10 @@ json invoke_function(uintptr_t address, const std::string& method_name, const js
         auto param_name = JsonHelpers::wide_to_utf8(fparam->get_fname()->to_string());
         json arg_val;
 
-        if (args.is_object() && args.contains(param_name)) {
-            arg_val = args[param_name];
-        } else if (args.is_array() && arg_index < (int)args.size()) {
-            arg_val = args[arg_index];
+        if (normalized_args.is_object() && normalized_args.contains(param_name)) {
+            arg_val = normalized_args[param_name];
+        } else if (normalized_args.is_array() && arg_index < (int)normalized_args.size()) {
+            arg_val = normalized_args[arg_index];
         } else if (fparam->is_out_param()) {
             arg_index++;
             continue; // Skip unset out params

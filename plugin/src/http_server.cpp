@@ -50,7 +50,6 @@ static std::string get_dll_directory() {
 
 bool HttpServer::start(int port) {
     if (m_running.load()) return false;
-    m_port = port;
 
     // CORS headers for all responses
     m_server->set_default_headers({
@@ -77,6 +76,37 @@ bool HttpServer::start(int port) {
                 api->log_info("UEVR-MCP: Serving web dashboard from %s", web_dir.c_str());
             }
         }
+    }
+
+    // Try to bind, scanning ports if the preferred one is taken
+    auto& api = uevr::API::get();
+    constexpr int MAX_PORT_ATTEMPTS = 20;
+    bool bound = false;
+
+    for (int attempt = 0; attempt < MAX_PORT_ATTEMPTS; ++attempt) {
+        int try_port = port + attempt;
+        if (m_server->bind_to_port("127.0.0.1", try_port)) {
+            m_port = try_port;
+            bound = true;
+            if (api) {
+                if (attempt > 0) {
+                    api->log_info("UEVR-MCP: Port %d in use, bound to port %d instead", port, try_port);
+                } else {
+                    api->log_info("UEVR-MCP: Bound to port %d", try_port);
+                }
+            }
+            break;
+        }
+        if (api) {
+            api->log_info("UEVR-MCP: Port %d in use, trying next...", try_port);
+        }
+    }
+
+    if (!bound) {
+        if (api) {
+            api->log_error("UEVR-MCP: Failed to bind to any port in range %d-%d", port, port + MAX_PORT_ATTEMPTS - 1);
+        }
+        return false;
     }
 
     m_thread = std::thread(&HttpServer::server_thread_func, this);
@@ -119,8 +149,9 @@ void HttpServer::server_thread_func() {
     m_running.store(true);
     auto& api = uevr::API::get();
     if (api) {
-        api->log_info("UEVR-MCP: HTTP server starting on port %d", m_port);
+        api->log_info("UEVR-MCP: HTTP server listening on port %d", m_port);
     }
-    m_server->listen("127.0.0.1", m_port);
+    // Socket is already bound in start(); just accept connections.
+    m_server->listen_after_bind();
     m_running.store(false);
 }

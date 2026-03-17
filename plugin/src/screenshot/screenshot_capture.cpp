@@ -1,5 +1,6 @@
 #include "screenshot_capture.h"
 #include "../json_helpers.h"
+#include "../pipe_server.h"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -29,6 +30,15 @@ struct PixelConversionInfo {
     bool is_bgrx8{false};
     bool is_r10g10b10a2{false};
     bool is_r16g16b16a16_float{false};
+};
+
+struct FrameContentSummary {
+    uint8_t max_rgb{0};
+    size_t non_black_pixels{0};
+    int min_x{-1};
+    int min_y{-1};
+    int max_x{-1};
+    int max_y{-1};
 };
 
 static PixelConversionInfo get_conversion_info(DXGI_FORMAT format, size_t row_pitch, int width) {
@@ -149,6 +159,52 @@ static void convert_row_to_bgra8(const uint8_t* src_row, uint8_t* dst_row, int w
     }
 
     std::memcpy(dst_row, src_row, static_cast<size_t>(width) * 4);
+}
+
+static FrameContentSummary summarize_bgra8(const std::vector<uint8_t>& bgra, int width, int height) {
+    FrameContentSummary summary{};
+    const size_t pixel_count = bgra.size() / 4;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const uint8_t b = bgra[i * 4 + 0];
+        const uint8_t g = bgra[i * 4 + 1];
+        const uint8_t r = bgra[i * 4 + 2];
+        uint8_t max_rgb = r;
+        if (g > max_rgb) max_rgb = g;
+        if (b > max_rgb) max_rgb = b;
+        if (max_rgb > summary.max_rgb) {
+            summary.max_rgb = max_rgb;
+        }
+        if (max_rgb > 4) {
+            ++summary.non_black_pixels;
+            const int x = static_cast<int>(i % static_cast<size_t>(width));
+            const int y = static_cast<int>(i / static_cast<size_t>(width));
+            if (summary.min_x < 0 || x < summary.min_x) summary.min_x = x;
+            if (summary.min_y < 0 || y < summary.min_y) summary.min_y = y;
+            if (summary.max_x < 0 || x > summary.max_x) summary.max_x = x;
+            if (summary.max_y < 0 || y > summary.max_y) summary.max_y = y;
+        }
+    }
+    return summary;
+}
+
+static bool looks_blank_post_render_frame(const FrameContentSummary& summary, int width, int height) {
+    if (summary.max_rgb <= 4 || summary.non_black_pixels < 32 ||
+        summary.min_x < 0 || summary.min_y < 0 || summary.max_x < 0 || summary.max_y < 0) {
+        return true;
+    }
+
+    const double total_pixels = static_cast<double>(width) * static_cast<double>(height);
+    const double coverage_ratio = static_cast<double>(summary.non_black_pixels) / total_pixels;
+    const double bbox_width = static_cast<double>(summary.max_x - summary.min_x + 1);
+    const double bbox_height = static_cast<double>(summary.max_y - summary.min_y + 1);
+    const double bbox_area_ratio = (bbox_width * bbox_height) / total_pixels;
+
+    // The broken RoboQuest post-render path returns a tiny UEVR overlay island on a black texture.
+    if (coverage_ratio < 0.12 && bbox_area_ratio < 0.20) {
+        return true;
+    }
+
+    return false;
 }
 
 static std::string format_hresult(HRESULT hr) {
@@ -309,6 +365,7 @@ void ScreenshotCapture::set_error(std::string error) {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_result_ready = false;
         m_result_error = std::move(error);
+        m_allow_present_fallback = false;
         m_capture_requested.store(false);
     }
     m_cv.notify_all();
@@ -330,6 +387,9 @@ void ScreenshotCapture::set_result(std::vector<uint8_t>&& bgra, int width, int h
         m_last_capture_height = height;
         m_result_ready = true;
         m_result_error.clear();
+        m_allow_present_fallback = false;
+        m_last_rejected_capture_source.clear();
+        m_last_rejected_capture_reason.clear();
         m_capture_requested.store(false);
     }
     m_cv.notify_all();
@@ -349,6 +409,9 @@ json ScreenshotCapture::get_diagnostics() {
     int last_sample_count = 1;
     int last_sample_quality = 0;
     bool post_render_dx11_recent = false;
+    bool allow_present_fallback = false;
+    std::string last_rejected_source;
+    std::string last_rejected_reason;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -366,6 +429,9 @@ json ScreenshotCapture::get_diagnostics() {
         last_sample_quality = m_last_capture_sample_quality;
         post_render_dx11_recent = m_last_post_render_dx11.time_since_epoch().count() != 0 &&
                                   (std::chrono::steady_clock::now() - m_last_post_render_dx11) < std::chrono::milliseconds(250);
+        allow_present_fallback = m_allow_present_fallback;
+        last_rejected_source = m_last_rejected_capture_source;
+        last_rejected_reason = m_last_rejected_capture_reason;
     }
 
     json result;
@@ -375,6 +441,7 @@ json ScreenshotCapture::get_diagnostics() {
     result["captureRequested"] = capture_requested;
     result["preferredCapturePath"] = renderer_type == 0 ? "post_render_dx11" : "present_fallback";
     if (renderer_type == 0) result["postRenderDx11Active"] = post_render_dx11_recent;
+    if (allow_present_fallback) result["presentFallbackArmed"] = true;
     if (!last_source.empty()) result["lastCaptureSource"] = last_source;
     if (last_dxgi_format != 0) result["lastCaptureDxgiFormat"] = last_dxgi_format;
     if (last_row_pitch != 0) result["lastCaptureRowPitch"] = last_row_pitch;
@@ -382,6 +449,8 @@ json ScreenshotCapture::get_diagnostics() {
     if (last_height != 0) result["lastCaptureHeight"] = last_height;
     if (last_sample_count > 0) result["lastCaptureSampleCount"] = last_sample_count;
     result["lastCaptureSampleQuality"] = last_sample_quality;
+    if (!last_rejected_source.empty()) result["lastRejectedCaptureSource"] = last_rejected_source;
+    if (!last_rejected_reason.empty()) result["lastRejectedCaptureReason"] = last_rejected_reason;
 
     if (!initialized || !swap_chain) {
         return result;
@@ -464,6 +533,9 @@ json ScreenshotCapture::capture(int max_width, int max_height, int quality, int 
         m_result_bmp.clear();
         m_result_width = 0;
         m_result_height = 0;
+        m_allow_present_fallback = false;
+        m_last_rejected_capture_source.clear();
+        m_last_rejected_capture_reason.clear();
     }
 
     // Signal that a capture is requested
@@ -478,7 +550,11 @@ json ScreenshotCapture::capture(int max_width, int max_height, int quality, int 
 
         if (!ok) {
             m_capture_requested.store(false);
-            return json{{"error", "Screenshot capture timeout after " + std::to_string(timeout_ms) + "ms — no render callback received"}};
+            std::string error = "Screenshot capture timeout after " + std::to_string(timeout_ms) + "ms — no render callback received";
+            if (!m_last_rejected_capture_reason.empty()) {
+                error += " (last rejected capture: " + m_last_rejected_capture_reason + ")";
+            }
+            return json{{"error", error}};
         }
 
         if (!m_result_error.empty()) {
@@ -616,7 +692,8 @@ void ScreenshotCapture::on_present() {
     if (m_renderer_type == 0) {
         std::lock_guard<std::mutex> lock(m_mutex);
         const auto now = std::chrono::steady_clock::now();
-        if (m_last_post_render_dx11.time_since_epoch().count() != 0 &&
+        if (!m_allow_present_fallback &&
+            m_last_post_render_dx11.time_since_epoch().count() != 0 &&
             now - m_last_post_render_dx11 < std::chrono::milliseconds(250)) {
             return;
         }
@@ -634,17 +711,17 @@ void ScreenshotCapture::on_present() {
     }
 }
 
-void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const char* capture_source) {
+bool ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const char* capture_source) {
     if (!texture) {
         set_error("Failed to capture D3D11 texture: source texture was null");
-        return;
+        return false;
     }
 
     ID3D11Device* device = nullptr;
     texture->GetDevice(&device);
     if (!device) {
         set_error("Failed to capture D3D11 texture: source texture had no device");
-        return;
+        return false;
     }
 
     ID3D11DeviceContext* effective_context = context;
@@ -657,7 +734,7 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
     if (!effective_context) {
         device->Release();
         set_error("Failed to capture D3D11 texture: no device context available");
-        return;
+        return false;
     }
 
     D3D11_TEXTURE2D_DESC src_desc{};
@@ -683,7 +760,7 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
         if (owns_context) effective_context->Release();
         device->Release();
         set_error("Failed to create D3D11 staging texture (HRESULT=0x" + format_hresult(hr) + ")");
-        return;
+        return false;
     }
 
     ID3D11Texture2D* resolved = nullptr;
@@ -702,7 +779,7 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
             if (owns_context) effective_context->Release();
             device->Release();
             set_error("Failed to create D3D11 resolve texture (HRESULT=0x" + format_hresult(hr) + ")");
-            return;
+            return false;
         }
 
         effective_context->ResolveSubresource(resolved, 0, texture, 0, src_desc.Format);
@@ -719,7 +796,7 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
         if (owns_context) effective_context->Release();
         device->Release();
         set_error("Failed to map D3D11 staging texture (HRESULT=0x" + format_hresult(hr) + ")");
-        return;
+        return false;
     }
 
     int src_w = static_cast<int>(src_desc.Width);
@@ -739,6 +816,24 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
     if (owns_context) effective_context->Release();
     device->Release();
 
+    if (capture_source != nullptr && std::strcmp(capture_source, "post_render_dx11") == 0) {
+        const auto summary = summarize_bgra8(src_bgra, src_w, src_h);
+        if (looks_blank_post_render_frame(summary, src_w, src_h)) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_allow_present_fallback = true;
+            m_last_rejected_capture_source = capture_source;
+            m_last_rejected_capture_reason =
+                "blank post-render frame (maxRgb=" + std::to_string(summary.max_rgb) +
+                ", nonBlackPixels=" + std::to_string(summary.non_black_pixels) +
+                ", bbox=" + std::to_string(summary.min_x) + "," + std::to_string(summary.min_y) +
+                "-" + std::to_string(summary.max_x) + "," + std::to_string(summary.max_y) + ")";
+            PipeServer::get().log(
+                "Screenshot: rejected blank post_render_dx11 frame; falling back to present",
+                "Screenshot", "capture", "D3D11");
+            return false;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_last_capture_sample_count = static_cast<int>(src_desc.SampleDesc.Count);
@@ -746,6 +841,7 @@ void ScreenshotCapture::capture_d3d11_from_texture(ID3D11DeviceContext* context,
     }
 
     set_result(std::move(src_bgra), src_w, src_h, static_cast<int>(src_desc.Format), row_pitch, capture_source);
+    return true;
 }
 
 void ScreenshotCapture::capture_d3d11() {

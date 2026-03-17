@@ -43,6 +43,8 @@ public:
 
     // Status info
     void set_game_name(const std::string& name) { m_game_name = name; }
+    void set_http_port(int port) { m_http_port.store(port); }
+    int get_http_port() const { return m_http_port.load(); }
     std::chrono::steady_clock::time_point start_time() const { return m_start_time; }
 
 private:
@@ -64,4 +66,5 @@ private:
     static constexpr size_t MAX_LOG_ENTRIES = 500;
 
     std::string m_game_name;
+    std::atomic<int> m_http_port{0};
 };

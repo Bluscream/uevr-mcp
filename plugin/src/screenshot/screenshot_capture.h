@@ -32,7 +32,7 @@ private:
 
     void capture_d3d11();
     void capture_d3d12();
-    void capture_d3d11_from_texture(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const char* capture_source);
+    bool capture_d3d11_from_texture(ID3D11DeviceContext* context, ID3D11Texture2D* texture, const char* capture_source);
     void set_error(std::string error);
     void set_result(std::vector<uint8_t>&& bgra, int width, int height, int dxgi_format, int row_pitch, const char* capture_source);
 
@@ -67,4 +67,7 @@ private:
     int m_last_capture_sample_count{1};
     int m_last_capture_sample_quality{0};
     std::chrono::steady_clock::time_point m_last_post_render_dx11{};
+    bool m_allow_present_fallback{false};
+    std::string m_last_rejected_capture_source;
+    std::string m_last_rejected_capture_reason;
 };

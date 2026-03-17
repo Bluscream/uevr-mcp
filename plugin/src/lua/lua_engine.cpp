@@ -1215,7 +1215,8 @@ void LuaEngine::setup_coroutine_scheduler() {
     };
 
     // mcp.wait(seconds) — yield the current coroutine, resume after delay
-    mcp["wait"] = [this](lua_State* L, float seconds) -> int {
+    mcp["wait"] = [this](sol::this_state ts, float seconds) -> int {
+        lua_State* L = ts;
         auto& lua = m_state->lua;
         sol::state_view sv(L);
 
@@ -1238,7 +1239,8 @@ void LuaEngine::setup_coroutine_scheduler() {
     };
 
     // mcp.wait_until(predicate_fn) — yield, resume when predicate returns true
-    mcp["wait_until"] = [this](lua_State* L, sol::protected_function predicate) -> int {
+    mcp["wait_until"] = [this](sol::this_state ts, sol::protected_function predicate) -> int {
+        lua_State* L = ts;
         auto& lua = m_state->lua;
         sol::state_view sv(L);
 

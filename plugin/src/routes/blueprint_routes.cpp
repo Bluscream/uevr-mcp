@@ -26,6 +26,47 @@ static void send_json(httplib::Response& res, const json& data, int status = 200
     res.set_content(data.dump(2), "application/json");
 }
 
+static bool require_object_body(const json& body, httplib::Response& res) {
+    if (body.is_object()) {
+        return true;
+    }
+
+    send_json(res, json{{"error", "JSON body must be an object"}}, 400);
+    return false;
+}
+
+static bool read_optional_string(const json& body, const char* key, std::string& out, httplib::Response& res) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) {
+        out.clear();
+        return true;
+    }
+
+    if (!it->is_string()) {
+        send_json(res, json{{"error", std::string("Field '") + key + "' must be a string"}}, 400);
+        return false;
+    }
+
+    out = it->get<std::string>();
+    return true;
+}
+
+static bool read_optional_bool(const json& body, const char* key, bool default_value, bool& out, httplib::Response& res) {
+    auto it = body.find(key);
+    if (it == body.end() || it->is_null()) {
+        out = default_value;
+        return true;
+    }
+
+    if (!it->is_boolean()) {
+        send_json(res, json{{"error", std::string("Field '") + key + "' must be a boolean"}}, 400);
+        return false;
+    }
+
+    out = it->get<bool>();
+    return true;
+}
+
 // Check if a UClass is derived from AActor by walking the super chain
 static bool is_actor_class(API::UClass* cls) {
     static API::UClass* actor_class = nullptr;
@@ -51,8 +92,16 @@ void register_routes(httplib::Server& server) {
             return;
         }
 
-        auto class_name = body.value("className", "");
-        auto outer_str = body.value("outerAddress", "");
+        if (!require_object_body(body, res)) {
+            return;
+        }
+
+        std::string class_name;
+        std::string outer_str;
+        if (!read_optional_string(body, "className", class_name, res) ||
+            !read_optional_string(body, "outerAddress", outer_str, res)) {
+            return;
+        }
 
         if (class_name.empty()) {
             send_json(res, json{{"error", "Missing 'className'"}}, 400);
@@ -125,9 +174,18 @@ void register_routes(httplib::Server& server) {
             return;
         }
 
-        auto actor_str = body.value("actorAddress", "");
-        auto comp_class = body.value("componentClass", "");
-        bool deferred = body.value("deferred", false);
+        if (!require_object_body(body, res)) {
+            return;
+        }
+
+        std::string actor_str;
+        std::string comp_class;
+        bool deferred = false;
+        if (!read_optional_string(body, "actorAddress", actor_str, res) ||
+            !read_optional_string(body, "componentClass", comp_class, res) ||
+            !read_optional_bool(body, "deferred", false, deferred, res)) {
+            return;
+        }
 
         if (actor_str.empty() || comp_class.empty()) {
             send_json(res, json{{"error", "Missing 'actorAddress' or 'componentClass'"}}, 400);
@@ -251,8 +309,16 @@ void register_routes(httplib::Server& server) {
             return;
         }
 
-        auto class_name = body.value("className", "");
-        auto field_name = body.value("fieldName", "");
+        if (!require_object_body(body, res)) {
+            return;
+        }
+
+        std::string class_name;
+        std::string field_name;
+        if (!read_optional_string(body, "className", class_name, res) ||
+            !read_optional_string(body, "fieldName", field_name, res)) {
+            return;
+        }
 
         if (class_name.empty() || field_name.empty() || !body.contains("value")) {
             send_json(res, json{{"error", "Missing className, fieldName, or value"}}, 400);
@@ -305,7 +371,14 @@ void register_routes(httplib::Server& server) {
             return;
         }
 
-        auto addr_str = body.value("address", "");
+        if (!require_object_body(body, res)) {
+            return;
+        }
+
+        std::string addr_str;
+        if (!read_optional_string(body, "address", addr_str, res)) {
+            return;
+        }
         if (addr_str.empty()) {
             send_json(res, json{{"error", "Missing 'address'"}}, 400);
             return;
@@ -348,7 +421,14 @@ void register_routes(httplib::Server& server) {
             return;
         }
 
-        auto addr_str = body.value("address", "");
+        if (!require_object_body(body, res)) {
+            return;
+        }
+
+        std::string addr_str;
+        if (!read_optional_string(body, "address", addr_str, res)) {
+            return;
+        }
         if (addr_str.empty()) {
             send_json(res, json{{"error", "Missing 'address'"}}, 400);
             return;

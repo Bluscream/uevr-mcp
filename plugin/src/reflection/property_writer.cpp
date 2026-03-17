@@ -2,8 +2,97 @@
 #include "../json_helpers.h"
 
 #include <cstring>
+#include <initializer_list>
 
 using namespace uevr;
+
+namespace {
+
+API::UScriptStruct* get_vector_struct() {
+    static auto cached = []() -> API::UScriptStruct* {
+        auto& api = API::get();
+        if (!api) return nullptr;
+        auto modern = api->find_uobject<API::UScriptStruct>(L"ScriptStruct /Script/CoreUObject.Vector");
+        if (modern) return modern;
+        return api->find_uobject<API::UScriptStruct>(L"ScriptStruct /Script/CoreUObject.Object.Vector");
+    }();
+    return cached;
+}
+
+API::UScriptStruct* get_rotator_struct() {
+    static auto cached = []() -> API::UScriptStruct* {
+        auto& api = API::get();
+        if (!api) return nullptr;
+        auto modern = api->find_uobject<API::UScriptStruct>(L"ScriptStruct /Script/CoreUObject.Rotator");
+        if (modern) return modern;
+        return api->find_uobject<API::UScriptStruct>(L"ScriptStruct /Script/CoreUObject.Object.Rotator");
+    }();
+    return cached;
+}
+
+bool try_get_number_alias(const json& value, std::initializer_list<const char*> keys, double& out) {
+    if (!value.is_object()) {
+        return false;
+    }
+
+    for (const auto* key : keys) {
+        auto it = value.find(key);
+        if (it == value.end() || !it->is_number()) {
+            continue;
+        }
+
+        out = it->get<double>();
+        return true;
+    }
+
+    return false;
+}
+
+bool write_vector_like_struct(uintptr_t addr, API::UScriptStruct* ustruct, const json& value, std::string& error) {
+    const bool is_vector = ustruct == get_vector_struct();
+    const bool is_rotator = ustruct == get_rotator_struct();
+    if (!is_vector && !is_rotator) {
+        return false;
+    }
+
+    double a = 0.0;
+    double b = 0.0;
+    double c = 0.0;
+
+    const bool have_a = is_vector
+        ? try_get_number_alias(value, {"x", "X"}, a)
+        : try_get_number_alias(value, {"pitch", "Pitch", "x", "X"}, a);
+    const bool have_b = is_vector
+        ? try_get_number_alias(value, {"y", "Y"}, b)
+        : try_get_number_alias(value, {"yaw", "Yaw", "y", "Y"}, b);
+    const bool have_c = is_vector
+        ? try_get_number_alias(value, {"z", "Z"}, c)
+        : try_get_number_alias(value, {"roll", "Roll", "z", "Z"}, c);
+
+    if (!have_a || !have_b || !have_c) {
+        error = is_vector
+            ? "Vector struct requires x/y/z or X/Y/Z numeric fields"
+            : "Rotator struct requires pitch/yaw/roll or x/y/z numeric fields";
+        return true;
+    }
+
+    const bool use_double_components = ustruct->get_struct_size() == 24;
+    if (use_double_components) {
+        auto* d = reinterpret_cast<double*>(addr);
+        d[0] = a;
+        d[1] = b;
+        d[2] = c;
+    } else {
+        auto* f = reinterpret_cast<float*>(addr);
+        f[0] = static_cast<float>(a);
+        f[1] = static_cast<float>(b);
+        f[2] = static_cast<float>(c);
+    }
+
+    return true;
+}
+
+} // namespace
 
 namespace PropertyWriter {
 
@@ -117,6 +206,12 @@ bool write_property(void* base, API::FProperty* prop, const json& value, std::st
             auto sp = reinterpret_cast<API::FStructProperty*>(prop);
             auto ustruct = sp->get_struct();
             if (!ustruct) { error = "StructProperty has no struct descriptor"; return false; }
+
+            if (ustruct == get_vector_struct() || ustruct == get_rotator_struct()) {
+                if (write_vector_like_struct(addr, ustruct, value, error)) {
+                    return error.empty();
+                }
+            }
 
             // Set individual fields within the struct
             for (auto& [key, val] : value.items()) {

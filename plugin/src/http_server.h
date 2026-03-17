@@ -14,7 +14,9 @@ public:
         return instance;
     }
 
-    // Start the HTTP server on a background thread. Non-blocking.
+    // Start the HTTP server on a background thread.
+    // Tries the given port first; if it is taken, scans upward (up to 20 ports).
+    // Returns true only after the socket is actually bound.
     bool start(int port = 8899);
 
     // Stop the server and join the thread.

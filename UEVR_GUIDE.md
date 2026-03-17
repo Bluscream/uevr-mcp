@@ -825,6 +825,126 @@ Notes:
 - `OnJump()` immediately moved the live pawn and camera, while `Jump()` only produced a small camera nudge and left the pawn at the same world-space `z`.
 - This matters for low-gravity verification: use `OnJump()` for real motion, then read back `GravityScale`, `MovementMode`, and `K2_GetActorLocation()`.
 
+### RoboQuest: Use The Live Radio Actor, Not The Generated Template
+
+Basecamp exposes two different `BP_RadioBot` paths when you search by name:
+
+- the generated Blueprint template child-actor variable under `/Game/GeneratedBlueprints/Basecamp/...BP_RadioBot_0_GEN_VARIABLE`
+- the live persistent-level child-actor component under `/Game/Maps/Basecamp.Basecamp.PersistentLevel.BP_Basecamp_Layer_Base_C_...BP_RadioBot_0`
+
+For live demos, transform writes must target the persistent-level object chain:
+
+```text
+ChildActorComponent /Game/Maps/Basecamp.Basecamp.PersistentLevel.BP_Basecamp_Layer_Base_C_...BP_RadioBot_0
+  -> ChildActor = BP_RadioBot_C (live actor)
+  -> Root SkeletalMeshComponent = live visible mesh
+```
+
+Notes:
+- Moving or rotating the generated `_GEN_VARIABLE` entry only changes the template/default state and does not affect the live radio in Basecamp.
+- The persistent-level `ChildActorComponent` is the safest anchor to identify the live radio actor and its mesh.
+- If a search result path contains `/Game/GeneratedBlueprints/` or `_GEN_VARIABLE`, treat it as a template until proven otherwise.
+
+### RoboQuest: Direct Relaunch May Need Manual UEVR Injection
+
+After swapping `uevr_mcp.dll`, launching `RoboQuest-Win64-Shipping.exe` directly did not reliably come back with `uevr_mcp.dll` loaded, even though the game process itself started. The reliable automation fallback was:
+
+1. Launch the game executable.
+2. Wait until the process has a visible window and a D3D11/D3D12 module loaded.
+3. Inject `openxr_loader.dll`.
+4. Inject `UEVRBackend.dll`.
+
+Notes:
+- This is the same DLL injection order used by the local UEVR frontend injector.
+- Steam/UEVR auto-inject still works when the frontend path is healthy, but direct relaunch automation should not assume that.
+- If MCP HTTP and pipe both stay down after a DLL swap, verify whether `uevr_mcp.dll` is actually loaded in the process before debugging the plugin itself.
+
+### RoboQuest: Working Radio Demo Staging
+
+One repeatable staging for the Basecamp radio demo was:
+
+```text
+Player pawn:   x=-3400.0, y=2800.0, z=195.0
+Control rot:   pitch=2.0, yaw=76.0, roll=0.0
+Live radio:    x=-3029.4375, y=3433.1484, z=230.1836
+```
+
+For the visible topple step, the live persistent-level `ChildActorComponent` anchor was moved to:
+
+```text
+Location: x=-3029.4375, y=3433.1484, z=180.0
+Rotation: pitch=0.0, yaw=-155.8246, roll=-85.0
+```
+
+Notes:
+- The outgame fire path on `BP_OutgamePlayerController_C` is `StartFire(FireModeNum=0)`.
+- For the topple effect, moving the live child-actor anchor was more reliable than trying to ragdoll the radio mesh directly.
+- Desktop captures were the trustworthy visual verification path for this demo run because the on-screen UEVR/Meta XR overlay could still obscure the center of the game window.
+
+### MCP: Struct Arguments Arrive As JSON Strings At The Tool Boundary
+
+Several MCP tools accept vectors, rotators, colors, and other structured values, but the transport boundary exposes them as strings. The adapter must parse those strings into real JSON before posting to the plugin HTTP API.
+
+Examples:
+
+```text
+uevr_line_trace(start="{\"x\":0,\"y\":0,\"z\":0}", end="{\"x\":100,\"y\":0,\"z\":0}")
+uevr_write_field(address="0x...", fieldName="RelativeRotation", value="{\"pitch\":0,\"yaw\":90,\"roll\":0}")
+uevr_set_transform(address="0x...", location="{\"x\":1,\"y\":2,\"z\":3}")
+```
+
+Notes:
+- Forwarding those values as raw strings causes plugin-side errors like `Struct property requires JSON object`.
+- Older world routes also assumed omitted optional fields were absent instead of `null`; `/api/world/line_trace` and `/api/world/sphere_overlap` now tolerate explicit JSON `null` for optional parameters.
+- When debugging a tool mismatch, compare the MCP tool schema with the plugin HTTP route body shape before assuming the game-side route is wrong.
+
+### MCP: Screenshot Payload And Mouse Click Semantics
+
+Two small API details that mattered during live debugging:
+
+- `GET /api/screenshot` returns the JPEG payload in `data`.
+- `POST /api/input/mouse` now treats `move` as the click target when a `button`/`event` is also provided.
+
+Examples:
+
+```text
+GET /api/screenshot
+-> { "format": "jpeg", "data": "<base64...>", ... }
+
+POST /api/input/mouse
+{
+  "button": "left",
+  "event": "click",
+  "move": { "x": 732, "y": 274 }
+}
+```
+
+Notes:
+- Older screenshot consumers that expected `imageBase64` need to read `data` instead.
+- On RoboQuest D3D11, `post_render_dx11` can stay active while returning a tiny UEVR overlay island on an otherwise black texture. The screenshot path now rejects those frames and falls back to `present_fallback_d3d11` automatically instead of returning a black image.
+- If screenshot captures go dark again, check `GET /api/diagnostics/render` and the plugin log together. The telltale pattern is `postRenderDx11Active=true`, `lastCaptureSource=post_render_dx11`, and log lines like `Screenshot: rejected blank post_render_dx11 frame; falling back to present`.
+- Older mouse input behavior treated `move` as a pure move-only request and returned before the click logic ran.
+
+### Shared Script Folder: Guard MCP-Only Lua Mods
+
+UEVR's built-in `LuaLoader` and the MCP Lua engine both use the same persistent `scripts` directory. If you drop an MCP-only test mod into that folder and it assumes `mcp` exists at file scope, plain UEVR startup will execute it first and can throw a modal Lua error before the MCP VM ever gets control.
+
+Use this guard at the top of any MCP-specific script:
+
+```lua
+if mcp == nil then
+    return {
+        skipped = true,
+        reason = "mcp unavailable",
+    }
+end
+```
+
+Notes:
+- This was required for the RoboQuest test mods: `test_mod_frame_heartbeat.lua`, `test_mod_scheduler_probe.lua`, and `test_mod_gravity_guard.lua`.
+- Without the guard, UEVR's `LuaLoader` raised a startup error because `mcp` is not defined in the plain UEVR Lua environment.
+- With the guard in place, the same files can live in the shared `scripts` folder, no-op under plain UEVR Lua, and still be hot-reloaded by MCP with full `mcp.*` APIs available.
+
 ---
 
 ## Appendix: Property Type Mapping

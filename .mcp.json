@@ -3,10 +3,7 @@
     "uevr": {
       "type": "stdio",
       "command": "dotnet",
-      "args": ["run", "--project", "mcp-server"],
-      "env": {
-        "UEVR_MCP_API_URL": "http://localhost:8899"
-      }
+      "args": ["run", "--project", "mcp-server"]
     }
   }
 }

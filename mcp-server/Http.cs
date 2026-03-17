@@ -7,12 +7,59 @@ namespace UevrMcp;
 
 static class Http
 {
-    static readonly string Base = Environment.GetEnvironmentVariable("UEVR_MCP_API_URL") ?? "http://localhost:8899";
+    static string? _base;
     static readonly HttpClient Client = new();
     static readonly JsonSerializerOptions JsonOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
+
+    /// <summary>
+    /// Resolve the HTTP base URL. Priority:
+    ///   1. UEVR_MCP_API_URL environment variable (explicit override)
+    ///   2. Port discovered from the named pipe (get_http_port command)
+    ///   3. Fallback to http://localhost:8899
+    /// </summary>
+    static string Base
+    {
+        get
+        {
+            if (_base != null) return _base;
+
+            var envUrl = Environment.GetEnvironmentVariable("UEVR_MCP_API_URL");
+            if (!string.IsNullOrEmpty(envUrl))
+            {
+                _base = envUrl;
+                return _base;
+            }
+
+            // Try to discover the actual port from the plugin pipe
+            var pipeResponse = Pipe.Request("get_http_port").GetAwaiter().GetResult();
+            if (pipeResponse != null)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(pipeResponse);
+                    if (doc.RootElement.TryGetProperty("http_port", out var portEl))
+                    {
+                        var port = portEl.GetInt32();
+                        _base = $"http://localhost:{port}";
+                        return _base;
+                    }
+                }
+                catch { /* fall through to default */ }
+            }
+
+            _base = "http://localhost:8899";
+            return _base;
+        }
+    }
+
+    /// <summary>
+    /// Force re-discovery of the HTTP port on the next request.
+    /// Called when an HTTP transport failure suggests the port may have changed.
+    /// </summary>
+    internal static void InvalidateBase() => _base = null;
 
     static string ErrorJson(string method, string url, string error, string? detail = null, int? status = null, string? body = null)
         => JsonSerializer.Serialize(new {
@@ -45,6 +92,9 @@ static class Http
         }
         catch (HttpRequestException ex)
         {
+            // Connection refused / transport failure may mean the port changed —
+            // invalidate so next request re-discovers from the pipe.
+            InvalidateBase();
             return ErrorJson(
                 request.Method.Method,
                 request.RequestUri?.ToString() ?? request.Method.Method,
