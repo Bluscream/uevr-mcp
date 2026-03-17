@@ -18,13 +18,59 @@ public static class PipeTools
     [Description("Get recent log entries from the UEVR-MCP plugin ring buffer (via named pipe).")]
     public static async Task<string> GetLog(
         [Description("Max entries to return (default 100)")] int maxEntries = 100)
-        => await Pipe.Request("get_log", new() { ["max_entries"] = maxEntries })
-           ?? """{"error":"pipe not connected"}""";
+    {
+        var pipe = await Pipe.Request("get_log", new() { ["max_entries"] = maxEntries });
+        if (pipe is not null) return pipe;
+
+        try {
+            return await Http.Get("/api/log", new() { ["maxEntries"] = maxEntries.ToString() });
+        } catch {
+            return """{"error":"pipe and HTTP log endpoints unavailable"}""";
+        }
+    }
 
     [McpServerTool(Name = "uevr_clear_log")]
     [Description("Clear the UEVR-MCP log ring buffer (via named pipe).")]
     public static async Task<string> ClearLog()
-        => await Pipe.Request("clear_log") ?? """{"error":"pipe not connected"}""";
+    {
+        var pipe = await Pipe.Request("clear_log");
+        if (pipe is not null) return pipe;
+
+        try {
+            return await Http.Delete("/api/log", new { });
+        } catch {
+            return """{"error":"pipe and HTTP log endpoints unavailable"}""";
+        }
+    }
+}
+
+[McpServerToolType]
+public static class DiagnosticsTools
+{
+    [McpServerTool(Name = "uevr_get_diagnostics")]
+    [Description("Get comprehensive plugin diagnostics: callback health, breadcrumb, plugin log, render metadata, loaded plugins, latest crash dump, current world/controller/pawn, and UEVR log tail.")]
+    public static async Task<string> GetDiagnostics(
+        [Description("Max plugin log entries to include (default 150)")] int maxLogEntries = 150,
+        [Description("Max UEVR log lines to include (default 120)")] int maxUevrLogLines = 120)
+        => await Http.Get("/api/diagnostics/snapshot", new() {
+            ["maxLogEntries"] = maxLogEntries.ToString(),
+            ["maxUevrLogLines"] = maxUevrLogLines.ToString()
+        });
+
+    [McpServerTool(Name = "uevr_get_callback_health")]
+    [Description("Get callback invocation/success/failure counters and last error info for key plugin callbacks like Lua frame/timer dispatch, property watch tick, and render hooks.")]
+    public static async Task<string> GetCallbackHealth()
+        => await Http.Get("/api/diagnostics/callbacks");
+
+    [McpServerTool(Name = "uevr_get_breadcrumb")]
+    [Description("Get the current crash breadcrumb state and breadcrumb file path written by the plugin around risky callback boundaries.")]
+    public static async Task<string> GetBreadcrumb()
+        => await Http.Get("/api/diagnostics/breadcrumb");
+
+    [McpServerTool(Name = "uevr_get_loaded_plugins")]
+    [Description("List UEVR plugin DLLs discovered in the global and game-specific plugin folders, including which ones are currently loaded in the game process.")]
+    public static async Task<string> GetLoadedPlugins()
+        => await Http.Get("/api/diagnostics/plugins");
 }
 
 // ── Agent guide ─────────────────────────────────────────────────────

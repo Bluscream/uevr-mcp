@@ -4,6 +4,8 @@
 #include "game_thread_queue.h"
 #include "json_helpers.h"
 #include "routes/status_routes.h"
+#include "routes/log_routes.h"
+#include "routes/diagnostics_routes.h"
 #include "routes/explorer_routes.h"
 #include "routes/console_routes.h"
 #include "routes/vr_routes.h"
@@ -93,6 +95,8 @@ void HttpServer::stop() {
 
 void HttpServer::register_routes() {
     StatusRoutes::register_routes(*m_server);
+    LogRoutes::register_routes(*m_server);
+    DiagnosticsRoutes::register_routes(*m_server);
     ExplorerRoutes::register_routes(*m_server);
     ConsoleRoutes::register_routes(*m_server);
     VrRoutes::register_routes(*m_server);

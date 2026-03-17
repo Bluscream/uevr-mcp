@@ -2,6 +2,7 @@
 #include <uevr/Plugin.hpp>
 
 #include "http_server.h"
+#include "diagnostics.h"
 #include "pipe_server.h"
 #include "game_thread_queue.h"
 #include "json_helpers.h"
@@ -18,14 +19,25 @@ using namespace uevr;
 
 namespace {
 
-void log_current_exception(const char* context) {
-    try {
-        throw;
-    } catch (const std::exception& e) {
-        PipeServer::get().log(std::string(context) + ": " + e.what());
-    } catch (...) {
-        PipeServer::get().log(std::string(context) + ": unknown C++ exception");
+std::string current_renderer_name() {
+    auto& api = API::get();
+    if (!api || !api->param() || !api->param()->renderer) {
+        return {};
     }
+
+    switch (api->param()->renderer->renderer_type) {
+    case UEVR_RENDERER_D3D11:
+        return "D3D11";
+    case UEVR_RENDERER_D3D12:
+        return "D3D12";
+    default:
+        return "Unknown";
+    }
+}
+
+void log_current_exception(const char* context, const char* callback = nullptr) {
+    const auto error = Diagnostics::describe_current_exception();
+    PipeServer::get().log(std::string(context) + ": " + error, "Diagnostics", callback ? callback : "", current_renderer_name());
 }
 
 } // namespace
@@ -49,6 +61,7 @@ public:
         pipe.set_game_name(game_name);
         pipe.start();
         pipe.log("Plugin initializing for " + game_name);
+        Diagnostics::get().initialize();
 
         // Start HTTP server
         auto& http = HttpServer::get();
@@ -86,21 +99,21 @@ public:
             // Process queued game-thread requests
             GameThreadQueue::get().process_pending(16);
         } catch (...) {
-            log_current_exception("UEVR-MCP: on_pre_engine_tick game-thread queue exception");
+            log_current_exception("UEVR-MCP: on_pre_engine_tick game-thread queue exception", "on_pre_engine_tick_queue");
         }
 
         try {
             // Run Lua frame callbacks and timers
             LuaEngine::get().on_frame(delta);
         } catch (...) {
-            log_current_exception("UEVR-MCP: on_pre_engine_tick Lua exception");
+            log_current_exception("UEVR-MCP: on_pre_engine_tick Lua exception", "lua_on_frame");
         }
 
         try {
             // Process property watches
             PropertyWatch::get().tick(StatusRoutes::get_tick_count());
         } catch (...) {
-            log_current_exception("UEVR-MCP: on_pre_engine_tick property watch exception");
+            log_current_exception("UEVR-MCP: on_pre_engine_tick property watch exception", "property_watch_tick");
         }
 
         // Track tick count for status
@@ -108,11 +121,25 @@ public:
     }
 
     void on_present() override {
+        Diagnostics::ScopedCallback diag("on_present", current_renderer_name());
         try {
-            // Screenshot capture from D3D backbuffer
+            // Fallback screenshot capture path when no post-render target is available.
             ScreenshotCapture::get().on_present();
         } catch (...) {
-            log_current_exception("UEVR-MCP: on_present exception");
+            const auto error = Diagnostics::describe_current_exception();
+            PipeServer::get().log("UEVR-MCP: on_present exception: " + error, "Diagnostics", "on_present", current_renderer_name());
+            diag.fail(error);
+        }
+    }
+
+    void on_post_render_vr_framework_dx11(ID3D11DeviceContext* context, ID3D11Texture2D* texture, ID3D11RenderTargetView*) override {
+        Diagnostics::ScopedCallback diag("on_post_render_vr_framework_dx11", "D3D11");
+        try {
+            ScreenshotCapture::get().on_post_render_dx11(context, texture);
+        } catch (...) {
+            const auto error = Diagnostics::describe_current_exception();
+            PipeServer::get().log("UEVR-MCP: on_post_render_vr_framework_dx11 exception: " + error, "Diagnostics", "on_post_render_vr_framework_dx11", "D3D11");
+            diag.fail(error);
         }
     }
 

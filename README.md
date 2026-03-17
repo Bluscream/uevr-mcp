@@ -7,6 +7,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 - **Full VR control.** HMD and controller poses, haptic feedback, snap turn, aim method, motion controller attachment — complete VR subsystem access.
 - **Live Lua scripting.** Execute Lua code in the game process with persistent state, frame callbacks, timers, async coroutines, and a module system. Hot-reload scripts without losing state. Write and deploy scripts to the UEVR autorun folder.
 - **Screenshot from the GPU.** Capture the game's D3D11 or D3D12 backbuffer as JPEG — works even when the game window is behind other windows. Handles R10G10B10A2, FP16 HDR, BGRA8, and RGBA8 formats with high-quality WIC scaling.
+- **Crash diagnostics built in.** Pull a single snapshot with callback health counters, breadcrumb state, plugin inventory, latest crash dump, UEVR log tail, runtime map/controller/pawn, and live render metadata.
 - **Reverse-engineer anything.** Snapshot an object's state, perform an action, diff to see what changed. Hook any UFunction to log calls, block execution, or run Lua callbacks with argument inspection. Watch properties with Lua triggers for reactive scripting.
 - **Real-time event streaming.** Poll for hook fires, watch changes, and Lua output in real time via long-polling.
 - **Works across games.** Same 112 tools work on any Unreal Engine game that UEVR supports.
@@ -67,8 +68,9 @@ The plugin is a C++ DLL loaded by UEVR into the game process. It uses the UEVR C
 2. **Object inspection** reads field values from live objects via FProperty offsets
 3. **Method invocation** calls UFunctions through `process_event` with full parameter marshaling
 4. **Chain queries** walk the object graph server-side, expanding fields, calling methods, filtering, and collecting results in a single request
-5. **Screenshot capture** copies the D3D11 or D3D12 backbuffer on the present thread, encodes as JPEG via WIC
-6. **Lua execution** runs code in an embedded Sol2/Lua 5.4 state with UEVR API bindings
+5. **Screenshot capture** prefers UEVR's D3D11 post-render target, falls back to present when needed, and encodes via WIC
+6. **Diagnostics snapshot** bundles structured plugin logs, callback health, breadcrumbs, render metadata, loaded plugins, crash-dump info, runtime world state, and the UEVR log tail
+7. **Lua execution** runs code in an embedded Sol2/Lua 5.4 state with UEVR API bindings
 
 The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP endpoint. A named pipe provides a secondary channel for status and log operations.
 
@@ -99,11 +101,11 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
   +-----------------+
 ```
 
-**`plugin/`** — A C++ DLL loaded by UEVR inside the game. Embeds Lua 5.4 + Sol2, cpp-httplib, nlohmann/json. Starts an HTTP server on `localhost:8899` exposing 110 REST endpoints. Hooks into the engine tick, D3D present, and XInput callbacks. HTTP handler threads submit work to the game thread via a `GameThreadQueue` (std::promise/future, up to 16 items per tick, 5s timeout) to safely access UE internals. A named pipe (`\\.\pipe\UEVR_MCP`) provides a secondary channel for status and log operations that work even before the HTTP server is ready.
+**`plugin/`** — A C++ DLL loaded by UEVR inside the game. Embeds Lua 5.4 + Sol2, cpp-httplib, nlohmann/json. Starts an HTTP server on `localhost:8899` exposing the gameplay API plus a diagnostics surface for structured logs, breadcrumbs, callback counters, plugin inventory, render metadata, and crash snapshots. Hooks into the engine tick, D3D present, D3D11 post-render, and XInput callbacks. HTTP handler threads submit work to the game thread via a `GameThreadQueue` (std::promise/future, up to 16 items per tick, 5s timeout) to safely access UE internals. A named pipe (`\\.\pipe\UEVR_MCP`) provides a secondary channel for status and log operations that work even before the HTTP server is ready.
 
-**`mcp-server/`** — A standalone .NET console app that speaks MCP over stdio. Translates tool calls into HTTP requests, falling back to the named pipe for status/log/game-info when HTTP is unavailable.
+**`mcp-server/`** — A standalone .NET console app that speaks MCP over stdio. Translates tool calls into HTTP requests, falling back to the named pipe for status/log/game-info when HTTP is unavailable. Diagnostics tools map directly to the HTTP snapshot and per-surface diagnostics routes.
 
-## 112 MCP Tools
+## 116 MCP Tools
 
 ### Object Exploration (12 tools)
 
@@ -201,6 +203,15 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 |------|-------------|
 | `uevr_screenshot` | Capture from D3D11/D3D12 backbuffer as JPEG. Works when game isn't in front. Handles R10G10B10A2, FP16, BGRA8, RGBA8. Configurable resolution and quality. |
 | `uevr_screenshot_info` | Check if D3D capture is initialized and which renderer is in use |
+
+### Diagnostics (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_get_diagnostics` | One-shot crash/debug snapshot: callback health, breadcrumb, plugin log, render metadata, loaded plugins, latest crash dump, runtime map/controller/pawn, UEVR log tail |
+| `uevr_get_callback_health` | Per-callback invocation/success/failure counters and last error info |
+| `uevr_get_breadcrumb` | Read the persisted breadcrumb file/state written around risky callback boundaries |
+| `uevr_get_loaded_plugins` | Inventory UEVR plugin DLLs in global and game-specific plugin folders and show which are currently loaded |
 
 ### Property Watch & Snapshot/Diff (9 tools)
 

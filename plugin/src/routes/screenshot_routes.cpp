@@ -46,7 +46,8 @@ void register_routes(httplib::Server& server) {
         if (!result.contains("error")) {
             PipeServer::get().log("Screenshot: capture " +
                 std::to_string(result["width"].get<int>()) + "x" +
-                std::to_string(result["height"].get<int>()));
+                std::to_string(result["height"].get<int>()) +
+                " via " + result.value("captureSource", std::string("unknown")));
         }
 
         send_json(res, result);
@@ -65,6 +66,13 @@ void register_routes(httplib::Server& server) {
             case 0:  result["rendererType"] = "D3D11"; break;
             case 1:  result["rendererType"] = "D3D12"; break;
             default: result["rendererType"] = "Unknown"; break;
+        }
+
+        result["capturePath"] = (rt == 0) ? "post_render_dx11_preferred_with_present_fallback"
+                                           : "present_fallback";
+        auto last_source = cap.last_capture_source();
+        if (!last_source.empty()) {
+            result["lastCaptureSource"] = last_source;
         }
 
         send_json(res, result);

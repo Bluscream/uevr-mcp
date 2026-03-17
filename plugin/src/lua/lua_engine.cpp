@@ -1,4 +1,5 @@
 #include "lua_engine.h"
+#include "../diagnostics.h"
 #include "../pipe_server.h"
 #include "../json_helpers.h"
 #include "../event_bus.h"
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <optional>
 #include <unordered_set>
 
 using namespace uevr;
@@ -130,14 +132,9 @@ private:
     lua_State* m_state{};
 };
 
-static void log_current_exception(const std::string& context) {
-    try {
-        throw;
-    } catch (const std::exception& e) {
-        PipeServer::get().log(context + ": " + e.what());
-    } catch (...) {
-        PipeServer::get().log(context + ": unknown C++ exception");
-    }
+static void log_current_exception(const std::string& context, const std::string& callback = {}) {
+    const auto error = Diagnostics::describe_current_exception();
+    PipeServer::get().log(context + ": " + error, "LuaEngine", callback);
 }
 
 template <typename T>
@@ -861,23 +858,35 @@ void LuaEngine::on_frame(float delta) {
 
     if (!m_initialized || !m_state) return;
 
+    Diagnostics::ScopedCallback on_frame_diag("lua_on_frame");
+
     try {
         auto& lua = m_state->lua;
         sol::table callbacks = lua["_mcp_frame_callbacks"];
         if (!callbacks.valid()) return;
 
         callbacks.for_each([&](const sol::object&, const sol::object& val) {
+            std::optional<Diagnostics::ScopedCallback> frame_diag;
             try {
                 if (val.get_type() != sol::type::function) return;
+                frame_diag.emplace("lua_frame_callback");
 
                 sol::protected_function fn = val.as<sol::protected_function>();
                 auto result = fn(delta);
                 if (!result.valid()) {
                     sol::error err = result;
-                    PipeServer::get().log("LuaEngine: frame callback error: " + std::string(err.what()));
+                    const auto error = std::string(err.what());
+                    PipeServer::get().log("LuaEngine: frame callback error: " + error, "LuaEngine", "lua_frame_callback");
+                    frame_diag->fail(error);
                 }
             } catch (...) {
-                log_current_exception("LuaEngine: frame callback dispatch exception");
+                const auto error = Diagnostics::describe_current_exception();
+                PipeServer::get().log("LuaEngine: frame callback dispatch exception: " + error, "LuaEngine", "lua_frame_callback");
+                if (frame_diag.has_value()) {
+                    frame_diag->fail(error);
+                } else {
+                    Diagnostics::get().callback_failure("lua_frame_callback", error);
+                }
             }
         });
 
@@ -890,6 +899,7 @@ void LuaEngine::on_frame(float delta) {
 
         timers.for_each([&](const sol::object&, const sol::object& val) {
             int entry_id = 0;
+            std::optional<Diagnostics::ScopedCallback> timer_diag;
             try {
                 if (val.get_type() != sol::type::table) return;
 
@@ -901,10 +911,13 @@ void LuaEngine::on_frame(float delta) {
                 if (remaining <= 0.0f) {
                     sol::optional<sol::protected_function> cb = entry["callback"];
                     if (cb.has_value()) {
+                        timer_diag.emplace("lua_timer_callback");
                         auto result = cb.value()();
                         if (!result.valid()) {
                             sol::error err = result;
-                            PipeServer::get().log("LuaEngine: timer callback error: " + std::string(err.what()));
+                            const auto error = std::string(err.what());
+                            PipeServer::get().log("LuaEngine: timer callback error: " + error, "LuaEngine", "lua_timer_callback");
+                            timer_diag->fail(error);
                         }
                     }
 
@@ -920,7 +933,13 @@ void LuaEngine::on_frame(float delta) {
                     entry["remaining"] = remaining;
                 }
             } catch (...) {
-                log_current_exception("LuaEngine: timer dispatch exception");
+                const auto error = Diagnostics::describe_current_exception();
+                PipeServer::get().log("LuaEngine: timer dispatch exception: " + error, "LuaEngine", "lua_timer_callback");
+                if (timer_diag.has_value()) {
+                    timer_diag->fail(error);
+                } else {
+                    Diagnostics::get().callback_failure("lua_timer_callback", error);
+                }
                 if (entry_id != 0) {
                     to_remove.push_back(entry_id);
                 }
@@ -940,10 +959,12 @@ void LuaEngine::on_frame(float delta) {
 
         coroutines.for_each([&](const sol::object&, const sol::object& val) {
             int entry_id = 0;
+            std::optional<Diagnostics::ScopedCallback> coroutine_diag;
             try {
                 if (val.get_type() != sol::type::table) return;
                 sol::table entry = val.as<sol::table>();
                 entry_id = entry["id"].get_or(0);
+                coroutine_diag.emplace("lua_coroutine_dispatch");
 
                 std::string wait_type = entry["wait_type"].get_or<std::string>("none");
                 bool ready = false;
@@ -967,7 +988,9 @@ void LuaEngine::on_frame(float delta) {
                             }
                         } else {
                             sol::error err = pred_result;
-                            PipeServer::get().log("LuaEngine: coroutine predicate error: " + std::string(err.what()));
+                            const auto error = std::string(err.what());
+                            PipeServer::get().log("LuaEngine: coroutine predicate error: " + error, "LuaEngine", "lua_coroutine_dispatch");
+                            coroutine_diag->fail(error);
                         }
                     }
                 } else {
@@ -997,7 +1020,9 @@ void LuaEngine::on_frame(float delta) {
                     auto result = co();
                     if (!result.valid()) {
                         sol::error err = result;
-                        PipeServer::get().log("LuaEngine: coroutine error: " + std::string(err.what()));
+                        const auto error = std::string(err.what());
+                        PipeServer::get().log("LuaEngine: coroutine error: " + error, "LuaEngine", "lua_coroutine_dispatch");
+                        coroutine_diag->fail(error);
                         int id = entry["id"].get_or(0);
                         co_remove.push_back(id);
                         return;
@@ -1012,7 +1037,13 @@ void LuaEngine::on_frame(float delta) {
                     // If yielded, the coroutine set its own wait_type via mcp.wait/wait_until
                 }
             } catch (...) {
-                log_current_exception("LuaEngine: coroutine dispatch exception");
+                const auto error = Diagnostics::describe_current_exception();
+                PipeServer::get().log("LuaEngine: coroutine dispatch exception: " + error, "LuaEngine", "lua_coroutine_dispatch");
+                if (coroutine_diag.has_value()) {
+                    coroutine_diag->fail(error);
+                } else {
+                    Diagnostics::get().callback_failure("lua_coroutine_dispatch", error);
+                }
                 if (entry_id != 0) {
                     co_remove.push_back(entry_id);
                 }
@@ -1023,7 +1054,9 @@ void LuaEngine::on_frame(float delta) {
             coroutines[id] = sol::nil;
         }
     } catch (...) {
-        log_current_exception("LuaEngine: on_frame outer exception");
+        const auto error = Diagnostics::describe_current_exception();
+        PipeServer::get().log("LuaEngine: on_frame outer exception: " + error, "LuaEngine", "lua_on_frame");
+        on_frame_diag.fail(error);
     }
 }
 

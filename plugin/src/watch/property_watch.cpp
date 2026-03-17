@@ -1,4 +1,5 @@
 #include "property_watch.h"
+#include "../diagnostics.h"
 #include "../reflection/property_reader.h"
 #include "../json_helpers.h"
 #include "../pipe_server.h"
@@ -7,6 +8,7 @@
 #include "../event_bus.h"
 
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <uevr/API.hpp>
 
 using json = nlohmann::json;
@@ -322,6 +324,7 @@ json PropertyWatch::delete_snapshot(int snapshot_id) {
 
 void PropertyWatch::tick(uint64_t current_tick) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    Diagnostics::ScopedCallback tick_diag("property_watch_tick");
 
     for (auto& [id, watch] : m_watches) {
         if (!watch.active) continue;
@@ -350,9 +353,20 @@ void PropertyWatch::tick(uint64_t current_tick) {
         auto fprop = reinterpret_cast<API::FProperty*>(prop);
 
         json value;
+        std::optional<Diagnostics::ScopedCallback> read_diag;
         try {
+            read_diag.emplace("property_watch_read");
             value = PropertyReader::read_property(obj, fprop, 1);
         } catch (...) {
+            const auto error = Diagnostics::describe_current_exception();
+            PipeServer::get().log("Watch: read_property exception on " +
+                                  JsonHelpers::address_to_string(watch.address) + "." + watch.field_name +
+                                  ": " + error, "Watch", "property_watch_read");
+            if (read_diag.has_value()) {
+                read_diag->fail(error);
+            } else {
+                Diagnostics::get().callback_failure("property_watch_read", error);
+            }
             continue;
         }
 

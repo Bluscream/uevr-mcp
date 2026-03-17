@@ -621,6 +621,7 @@ API::UObjectHook::exists(obj);   // validate object lifetime
 ├── cameras.txt                       # Camera presets
 ├── imgui.ini                         # ImGui layout
 ├── log.txt                           # UEVR log
+├── uevr_mcp_last_breadcrumb.json     # Last callback/breadcrumb state written by the MCP plugin
 ├── plugins/                          # Plugin DLLs (e.g. uevr_mcp.dll)
 ├── scripts/                          # Lua scripts
 └── uobjecthook/
@@ -645,6 +646,23 @@ uevr_reload_config   # Reload settings from disk
 | `uevr_get_status` | Plugin health, game process, VR runtime |
 | `uevr_get_log` | Recent log entries |
 | `uevr_clear_log` | Clear log buffer |
+
+### Diagnostics
+| Tool | Description |
+|------|-------------|
+| `uevr_get_diagnostics` | Full crash/debug snapshot: callback health, breadcrumb, plugin log, render metadata, loaded plugins, latest crash dump, runtime map/controller/pawn, UEVR log tail |
+| `uevr_get_callback_health` | Per-callback invocation/success/failure counters and last error details |
+| `uevr_get_breadcrumb` | Current breadcrumb state plus the persisted breadcrumb file path |
+| `uevr_get_loaded_plugins` | UEVR plugin inventory for the global and game-specific plugin folders |
+
+HTTP diagnostics routes:
+`GET /api/log`
+`DELETE /api/log`
+`GET /api/diagnostics/callbacks`
+`GET /api/diagnostics/breadcrumb`
+`GET /api/diagnostics/render`
+`GET /api/diagnostics/plugins`
+`GET /api/diagnostics/snapshot`
 
 ### Explorer (Read)
 | Tool | Description |
@@ -791,8 +809,21 @@ uevr_invoke_method(controller_addr, "OnPressedAnyKey")
 Notes:
 - This was verified live while the screen was showing the canyon loading art and blocking progression.
 - The active loading widget was `WGT_LoadingScreen_C`, but calling `OnPressedAnyKey()` on `BP_IngamePlayerController_C` was enough to dismiss it and return to the world view.
-- Desktop screenshots were more reliable than the plugin backbuffer screenshot route for confirming the transition.
+- The plugin screenshot route is reliable again; `uevr_screenshot_info` and `GET /api/diagnostics/render` now report whether capture is coming from `post_render_dx11` or the present fallback.
 - If a future load lands on the same screen again, call `OnPressedAnyKey()` first before trying raw `uevr_input_key` or `uevr_input_gamepad`.
+
+### RoboQuest: Use `OnJump()` Instead Of `Jump()`
+
+For live movement tests in RoboQuest, the pawn's gameplay jump path is `OnJump()`. The base `Jump()` method can report `CanJump() = true` and still fail to move the pawn capsule in a useful way for testing.
+
+```
+uevr_get_player                                  # pawn should be BP_Sentinel_C
+uevr_invoke_method(pawn_addr, "OnJump")
+```
+
+Notes:
+- `OnJump()` immediately moved the live pawn and camera, while `Jump()` only produced a small camera nudge and left the pawn at the same world-space `z`.
+- This matters for low-gravity verification: use `OnJump()` for real motion, then read back `GravityScale`, `MovementMode`, and `K2_GetActorLocation()`.
 
 ---
 

@@ -6,6 +6,41 @@
 #include <uevr/API.hpp>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
+
+namespace {
+
+std::string infer_subsystem(const std::string& message) {
+    const auto pos = message.find(':');
+    if (pos == std::string::npos || pos == 0) {
+        return {};
+    }
+
+    auto subsystem = message.substr(0, pos);
+    const auto invalid = subsystem.find_first_of(" []\t");
+    if (invalid != std::string::npos) {
+        return {};
+    }
+
+    return subsystem;
+}
+
+json serialize_entry(const LogEntry& entry) {
+    json data{
+        {"seq", entry.seq},
+        {"timestamp", entry.timestamp},
+        {"threadId", entry.thread_id},
+        {"message", entry.message},
+        {"formatted", entry.formatted}
+    };
+
+    if (!entry.subsystem.empty()) data["subsystem"] = entry.subsystem;
+    if (!entry.callback.empty()) data["callback"] = entry.callback;
+    if (!entry.renderer.empty()) data["renderer"] = entry.renderer;
+    return data;
+}
+
+} // namespace
 
 PipeServer::~PipeServer() {
     stop();
@@ -32,7 +67,7 @@ void PipeServer::stop() {
     }
 }
 
-void PipeServer::log(const std::string& message) {
+void PipeServer::log(const std::string& message, const std::string& subsystem, const std::string& callback, const std::string& renderer) {
     // Timestamp the message
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
@@ -40,7 +75,17 @@ void PipeServer::log(const std::string& message) {
     oss << std::put_time(std::localtime(&t), "%H:%M:%S") << " " << message;
 
     std::lock_guard<std::mutex> lock(m_log_mutex);
-    m_log_entries.push_back(oss.str());
+    LogEntry entry;
+    entry.seq = m_next_log_seq++;
+    entry.timestamp = oss.str().substr(0, 8);
+    entry.thread_id = GetCurrentThreadId();
+    entry.message = message;
+    entry.formatted = oss.str();
+    entry.subsystem = subsystem.empty() ? infer_subsystem(message) : subsystem;
+    entry.callback = callback;
+    entry.renderer = renderer;
+
+    m_log_entries.push_back(std::move(entry));
     while (m_log_entries.size() > MAX_LOG_ENTRIES) {
         m_log_entries.pop_front();
     }
@@ -52,9 +97,21 @@ json PipeServer::get_log(int max_entries) const {
     int start = (int)m_log_entries.size() - max_entries;
     if (start < 0) start = 0;
     for (int i = start; i < (int)m_log_entries.size(); ++i) {
-        entries.push_back(m_log_entries[i]);
+        entries.push_back(m_log_entries[i].formatted);
     }
     return entries;
+}
+
+json PipeServer::get_log_entries(int max_entries) const {
+    std::lock_guard<std::mutex> lock(m_log_mutex);
+    json entries = json::array();
+    int start = static_cast<int>(m_log_entries.size()) - max_entries;
+    if (start < 0) start = 0;
+    for (int i = start; i < static_cast<int>(m_log_entries.size()); ++i) {
+        entries.push_back(serialize_entry(m_log_entries[i]));
+    }
+    const auto count = entries.size();
+    return json{{"entries", std::move(entries)}, {"count", count}, {"totalBuffered", m_log_entries.size()}};
 }
 
 void PipeServer::clear_log() {

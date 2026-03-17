@@ -46,6 +46,10 @@ void register_routes(httplib::Server& server) {
 
         result["endpoints"] = json::array({
             "/api", "/api/status", "/api/game_info", "/api/camera",
+            "/api/log",
+            "/api/diagnostics/callbacks", "/api/diagnostics/breadcrumb",
+            "/api/diagnostics/render", "/api/diagnostics/plugins",
+            "/api/diagnostics/snapshot",
             "/api/explorer/search", "/api/explorer/classes", "/api/explorer/type",
             "/api/explorer/object", "/api/explorer/summary", "/api/explorer/field",
             "/api/explorer/method", "/api/explorer/objects_by_class",

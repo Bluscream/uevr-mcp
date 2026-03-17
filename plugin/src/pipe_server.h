@@ -10,6 +10,17 @@
 
 using json = nlohmann::json;
 
+struct LogEntry {
+    uint64_t seq{0};
+    std::string timestamp;
+    uint32_t thread_id{0};
+    std::string message;
+    std::string formatted;
+    std::string subsystem;
+    std::string callback;
+    std::string renderer;
+};
+
 class PipeServer {
 public:
     static PipeServer& get() {
@@ -22,8 +33,12 @@ public:
     bool is_running() const { return m_running.load(); }
 
     // Logging ring buffer
-    void log(const std::string& message);
+    void log(const std::string& message,
+             const std::string& subsystem = {},
+             const std::string& callback = {},
+             const std::string& renderer = {});
     json get_log(int max_entries = 100) const;
+    json get_log_entries(int max_entries = 100) const;
     void clear_log();
 
     // Status info
@@ -44,7 +59,8 @@ private:
 
     // Log ring buffer
     mutable std::mutex m_log_mutex;
-    std::deque<std::string> m_log_entries;
+    std::deque<LogEntry> m_log_entries;
+    uint64_t m_next_log_seq{1};
     static constexpr size_t MAX_LOG_ENTRIES = 500;
 
     std::string m_game_name;
