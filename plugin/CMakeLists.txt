@@ -85,6 +85,10 @@ add_library(uevr_mcp SHARED
     src/hook/hook_registry.cpp
     src/event_bus.cpp
     src/routes/discovery_routes.cpp
+    src/process_event_listener.cpp
+    src/routes/process_event_routes.cpp
+    src/routes/motion_controller_routes.cpp
+    src/routes/timer_routes.cpp
 )
 
 target_include_directories(uevr_mcp PRIVATE

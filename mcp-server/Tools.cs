@@ -132,6 +132,12 @@ public static class GuideTools
 [McpServerToolType]
 public static class ExplorerReadTools
 {
+    [McpServerTool(Name = "uevr_is_valid")]
+    [Description("Check if a UObject pointer is still alive in the GUObjectArray. Returns true/false with optional class/name info if valid. Use this before operating on saved addresses — objects can be garbage collected at any time.")]
+    public static async Task<string> IsValid(
+        [Description("Object address (0xHEX)")] string address)
+        => await Http.Get("/api/explorer/is_valid", new() { ["address"] = address });
+
     [McpServerTool(Name = "uevr_search_objects")]
     [Description("Search GUObjectArray by full name substring. Returns matching UObject addresses, full names, and class names. Use to find specific objects in the game.")]
     public static async Task<string> SearchObjects(
@@ -296,6 +302,97 @@ public static class VrTools
     [Description("Reload UEVR configuration from disk.")]
     public static async Task<string> ReloadConfig()
         => await Http.Post("/api/vr/config/reload", new { });
+
+    [McpServerTool(Name = "uevr_vr_input")]
+    [Description("Get VR controller input state: left/right joystick axes, movement orientation, and optionally query specific OpenXR action states. Joystick values range from -1.0 to 1.0 on each axis.")]
+    public static async Task<string> VrInput(
+        [Description("Comma-separated OpenXR action paths to query (e.g. '/actions/default/in/Trigger,/actions/default/in/Grip'). Optional — omit to just get joystick axes.")] string? actions = null)
+        => await Http.Get("/api/vr/input", new() { ["actions"] = actions });
+
+    [McpServerTool(Name = "uevr_get_world_scale")]
+    [Description("Get the current world-to-meters scale from UWorld. Default is 100 (1 UE unit = 1 cm). Changing this affects how large the VR player feels relative to the game world.")]
+    public static async Task<string> GetWorldScale()
+        => await Http.Get("/api/vr/world_scale");
+
+    [McpServerTool(Name = "uevr_set_world_scale")]
+    [Description("Set the world-to-meters scale on UWorld. Default is 100. Lower values make the player feel larger (like a giant), higher values make them feel smaller (like a mouse). Example: 50 = everything appears twice as large, 200 = everything appears half size.")]
+    public static async Task<string> SetWorldScale(
+        [Description("World-to-meters scale value (must be > 0, default is 100)")] float scale)
+        => await Http.Post("/api/vr/world_scale", new { scale });
+}
+
+// ── Motion controller tools ─────────────────────────────────────────
+
+[McpServerToolType]
+public static class MotionControllerTools
+{
+    [McpServerTool(Name = "uevr_attach_to_controller")]
+    [Description("Attach a game object (actor/component) to a VR motion controller. The object will track the controller's position and rotation in real-time. This is the core mechanism for making VR mods feel native — attach weapons, tools, or UI to the player's hands.")]
+    public static async Task<string> Attach(
+        [Description("Object address (0xHEX) to attach")] string address,
+        [Description("Which hand: 'left', 'right', or 'hmd' (default 'right')")] string hand = "right",
+        [Description("Keep attachment across level transitions (default true)")] bool permanent = true,
+        [Description("Position offset from controller {x, y, z} (default {0,0,0})")] string? locationOffset = null,
+        [Description("Rotation offset as quaternion {x, y, z, w} (default {0,0,0,1} = no rotation)")] string? rotationOffset = null)
+    {
+        var body = new Dictionary<string, object?>
+        {
+            ["address"] = address,
+            ["hand"] = hand,
+            ["permanent"] = permanent
+        };
+        if (locationOffset != null)
+            body["locationOffset"] = JsonArgs.Parse(locationOffset);
+        if (rotationOffset != null)
+            body["rotationOffset"] = JsonArgs.Parse(rotationOffset);
+        return await Http.Post("/api/vr/attach", body);
+    }
+
+    [McpServerTool(Name = "uevr_detach_from_controller")]
+    [Description("Detach an object from its VR motion controller. The object stops tracking the controller and returns to its original transform behavior.")]
+    public static async Task<string> Detach(
+        [Description("Object address (0xHEX) to detach")] string address)
+        => await Http.Post("/api/vr/detach", new { address });
+
+    [McpServerTool(Name = "uevr_list_motion_controllers")]
+    [Description("List all objects currently attached to VR motion controllers. Shows which hand each object is attached to, position/rotation offsets, and whether the attachment is permanent.")]
+    public static async Task<string> ListAttachments()
+        => await Http.Get("/api/vr/attachments");
+
+    [McpServerTool(Name = "uevr_clear_motion_controllers")]
+    [Description("Remove ALL motion controller attachments. All objects stop tracking controllers.")]
+    public static async Task<string> ClearAttachments()
+        => await Http.Post("/api/vr/clear_attachments", new { });
+}
+
+// ── Timer tools ─────────────────────────────────────────────────────
+
+[McpServerToolType]
+public static class TimerTools
+{
+    [McpServerTool(Name = "uevr_timer_create")]
+    [Description("Create a timer that executes Lua code after a delay. Can be one-shot or looping. Returns a timer ID for later cancellation. The Lua code runs on the game thread with full UEVR API access.")]
+    public static async Task<string> TimerCreate(
+        [Description("Delay in seconds before the code runs (min 0.001)")] float delay,
+        [Description("Lua code to execute when the timer fires")] string code,
+        [Description("If true, repeats every 'delay' seconds until cancelled (default false)")] bool looping = false)
+        => await Http.Post("/api/timer/create", new { delay, code, looping });
+
+    [McpServerTool(Name = "uevr_timer_list")]
+    [Description("List all active timers with their IDs, delays, remaining time, and looping status.")]
+    public static async Task<string> TimerList()
+        => await Http.Get("/api/timer/list");
+
+    [McpServerTool(Name = "uevr_timer_cancel")]
+    [Description("Cancel a timer by ID. The timer's Lua code will no longer execute.")]
+    public static async Task<string> TimerCancel(
+        [Description("Timer ID to cancel")] int timerId)
+        => await Http.Delete("/api/timer/cancel", new { timerId });
+
+    [McpServerTool(Name = "uevr_timer_clear")]
+    [Description("Cancel ALL active timers.")]
+    public static async Task<string> TimerClear()
+        => await Http.Post("/api/timer/clear", new { });
 }
 
 // ── Player tools ────────────────────────────────────────────────────
@@ -942,6 +1039,66 @@ public static class HookTools
     [Description("Clear all function hooks.")]
     public static async Task<string> HookClear()
         => await Http.Post("/api/hook/clear", new { });
+}
+
+// ── ProcessEvent listener tools ───────────────────────────────────
+
+[McpServerToolType]
+public static class ProcessEventTools
+{
+    [McpServerTool(Name = "uevr_process_event_start")]
+    [Description("Start the global ProcessEvent listener — hooks UObject::ProcessEvent to capture ALL Blueprint/native function calls in real time. Use this to discover what functions the game is calling, then filter by name or call count. Equivalent to the 'ProcessEvent Listener' toggle under Developer in UEVR.")]
+    public static async Task<string> Start()
+        => await Http.Post("/api/process_event/start", new { });
+
+    [McpServerTool(Name = "uevr_process_event_stop")]
+    [Description("Stop the ProcessEvent listener. The hook stays installed (cheap to restart) but no data is collected.")]
+    public static async Task<string> Stop()
+        => await Http.Post("/api/process_event/stop", new { });
+
+    [McpServerTool(Name = "uevr_process_event_status")]
+    [Description("Get the ProcessEvent listener status — whether it's listening, hook state, number of unique functions seen, and ignore list size.")]
+    public static async Task<string> Status()
+        => await Http.Get("/api/process_event/status");
+
+    [McpServerTool(Name = "uevr_process_event_functions")]
+    [Description("Get all functions seen by the ProcessEvent listener, sorted by call count (descending). Filter with maxCalls (exclude functions called more than N times — useful to hide noisy tick functions) and search (substring match on function name). This is equivalent to 'All Called Functions' in UEVR's Developer tab.")]
+    public static async Task<string> GetFunctions(
+        [Description("Exclude functions with more than this many calls (0 = no limit)")] int? maxCalls = null,
+        [Description("Filter by function name substring (case-insensitive)")] string? search = null,
+        [Description("Max results to return (default 200)")] int? limit = null,
+        [Description("Sort order: 'count' (default, descending) or 'name' (alphabetical)")] string? sort = null)
+        => await Http.Get("/api/process_event/functions", new() {
+            ["maxCalls"] = maxCalls?.ToString(), ["search"] = search,
+            ["limit"] = limit?.ToString(), ["sort"] = sort
+        });
+
+    [McpServerTool(Name = "uevr_process_event_recent")]
+    [Description("Get the most recent ProcessEvent calls (newest first). Shows the live stream of function calls happening in the game right now. Equivalent to 'Recent Functions' in UEVR's Developer tab.")]
+    public static async Task<string> GetRecent(
+        [Description("Number of recent calls to return (default 50)")] int? count = null)
+        => await Http.Get("/api/process_event/recent", new() { ["count"] = count?.ToString() });
+
+    [McpServerTool(Name = "uevr_process_event_ignore")]
+    [Description("Ignore functions matching a name pattern — they won't appear in results or recent list. Use this to filter out noisy functions (e.g. 'Tick', 'ReceiveBeginPlay'). Pattern is a substring match.")]
+    public static async Task<string> Ignore(
+        [Description("Substring pattern to match function names to ignore")] string pattern)
+        => await Http.Post("/api/process_event/ignore", new { pattern });
+
+    [McpServerTool(Name = "uevr_process_event_ignore_all")]
+    [Description("Ignore ALL currently seen functions — useful to establish a baseline, then watch for new functions that appear when you perform an action in the game.")]
+    public static async Task<string> IgnoreAll()
+        => await Http.Post("/api/process_event/ignore_all", new { });
+
+    [McpServerTool(Name = "uevr_process_event_clear")]
+    [Description("Clear all tracked ProcessEvent data (function list and recent calls). Does not affect the ignore list.")]
+    public static async Task<string> Clear()
+        => await Http.Post("/api/process_event/clear", new { });
+
+    [McpServerTool(Name = "uevr_process_event_clear_ignored")]
+    [Description("Clear the ignore list so all functions are tracked again.")]
+    public static async Task<string> ClearIgnored()
+        => await Http.Post("/api/process_event/clear_ignored", new { });
 }
 
 // ── Macro tools ────────────────────────────────────────────────────

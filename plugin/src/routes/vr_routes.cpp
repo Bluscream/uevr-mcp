@@ -2,10 +2,16 @@
 #include "../game_thread_queue.h"
 #include "../json_helpers.h"
 #include "../pipe_server.h"
+#include "../reflection/object_explorer.h"
+#include "../reflection/property_reader.h"
+#include "../reflection/property_writer.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <uevr/API.hpp>
+
+#include <sstream>
+#include <string>
 
 using json = nlohmann::json;
 using VR = uevr::API::VR;
@@ -215,6 +221,159 @@ void register_routes(httplib::Server& server) {
         VR::reload_config();
         PipeServer::get().log("VR: config reloaded");
         res.set_content(json{{"success", true}}.dump(2), "application/json");
+    });
+
+    // GET /api/vr/input — Get controller input state (joystick axes, action states)
+    server.Get("/api/vr/input", [](const httplib::Request& req, httplib::Response& res) {
+        auto& api = uevr::API::get();
+        if (!api) {
+            res.status = 500;
+            res.set_content(json{{"error", "API not available"}}.dump(), "application/json");
+            return;
+        }
+
+        json result;
+        result["usingControllers"] = VR::is_using_contriollers();
+
+        // Joystick axes
+        auto left_src = VR::get_left_joystick_source();
+        auto right_src = VR::get_right_joystick_source();
+
+        auto left_axis = VR::get_joystick_axis(left_src);
+        auto right_axis = VR::get_joystick_axis(right_src);
+
+        result["leftJoystick"] = {{"x", left_axis.x}, {"y", left_axis.y}};
+        result["rightJoystick"] = {{"x", right_axis.x}, {"y", right_axis.y}};
+
+        // Query common OpenXR action states if actions are provided
+        if (req.has_param("actions")) {
+            auto actions_str = req.get_param_value("actions");
+            json action_states = json::object();
+
+            // Split comma-separated action paths
+            std::istringstream ss(actions_str);
+            std::string action_path;
+            while (std::getline(ss, action_path, ',')) {
+                // Trim whitespace
+                while (!action_path.empty() && action_path.front() == ' ') action_path.erase(0, 1);
+                while (!action_path.empty() && action_path.back() == ' ') action_path.pop_back();
+
+                if (action_path.empty()) continue;
+
+                auto handle = VR::get_action_handle(action_path);
+                if (handle) {
+                    bool left_active = VR::is_action_active(handle, left_src);
+                    bool right_active = VR::is_action_active(handle, right_src);
+                    action_states[action_path] = {
+                        {"left", left_active},
+                        {"right", right_active},
+                        {"any", left_active || right_active}
+                    };
+                } else {
+                    action_states[action_path] = {{"error", "action not found"}};
+                }
+            }
+            result["actions"] = action_states;
+        }
+
+        // Additional info
+        result["movementOrientation"] = VR::get_movement_orientation();
+        result["lowestXInputIndex"] = VR::get_lowest_xinput_index();
+
+        res.set_content(result.dump(2), "application/json");
+    });
+
+    // GET /api/vr/world_scale — Get world-to-meters scale from UWorld
+    server.Get("/api/vr/world_scale", [](const httplib::Request&, httplib::Response& res) {
+        auto result = GameThreadQueue::get().submit_and_wait([]() -> json {
+            auto& api = uevr::API::get();
+            if (!api) return json{{"error", "API not available"}};
+
+            // Find UWorld class and get first instance
+            auto* world_cls = api->find_uobject<uevr::API::UClass>(L"Class /Script/Engine.World");
+            if (!world_cls) return json{{"error", "Could not find World class"}};
+
+            auto* world = uevr::API::UObjectHook::get_first_object_by_class(world_cls);
+            if (!world) return json{{"error", "No World instance found"}};
+
+            // Read WorldToMetersScale via reflection
+            auto* type = reinterpret_cast<uevr::API::UStruct*>(world->get_class());
+            if (!type) return json{{"error", "World has no class"}};
+
+            auto* prop = type->find_property(L"WorldToMetersScale");
+            float scale = 100.0f; // UE default
+            if (prop) {
+                auto val = PropertyReader::read_property(world, prop, 1);
+                if (val.contains("value") && val["value"].is_number()) {
+                    scale = val["value"].get<float>();
+                }
+            }
+
+            return json{
+                {"worldToMetersScale", scale},
+                {"worldAddress", JsonHelpers::address_to_string(world)}
+            };
+        });
+
+        res.status = result.contains("error") ? 500 : 200;
+        res.set_content(result.dump(2), "application/json");
+    });
+
+    // POST /api/vr/world_scale — Set world-to-meters scale on UWorld
+    server.Post("/api/vr/world_scale", [](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(json{{"error", "Invalid JSON"}}.dump(), "application/json");
+            return;
+        }
+
+        if (!body.contains("scale")) {
+            res.status = 400;
+            res.set_content(json{{"error", "Missing 'scale' parameter"}}.dump(), "application/json");
+            return;
+        }
+
+        float new_scale = body["scale"].get<float>();
+        if (new_scale <= 0.0f) {
+            res.status = 400;
+            res.set_content(json{{"error", "Scale must be positive"}}.dump(), "application/json");
+            return;
+        }
+
+        auto result = GameThreadQueue::get().submit_and_wait([new_scale]() -> json {
+            auto& api = uevr::API::get();
+            if (!api) return json{{"error", "API not available"}};
+
+            auto* world_cls = api->find_uobject<uevr::API::UClass>(L"Class /Script/Engine.World");
+            if (!world_cls) return json{{"error", "Could not find World class"}};
+
+            auto* world = uevr::API::UObjectHook::get_first_object_by_class(world_cls);
+            if (!world) return json{{"error", "No World instance found"}};
+
+            auto* type = reinterpret_cast<uevr::API::UStruct*>(world->get_class());
+            if (!type) return json{{"error", "World has no class"}};
+
+            auto* prop = type->find_property(L"WorldToMetersScale");
+            if (!prop) return json{{"error", "WorldToMetersScale property not found on World"}};
+
+            std::string error;
+            if (!PropertyWriter::write_property(world, prop, json(new_scale), error)) {
+                return json{{"error", error}};
+            }
+
+            return json{
+                {"success", true},
+                {"worldToMetersScale", new_scale},
+                {"worldAddress", JsonHelpers::address_to_string(world)}
+            };
+        });
+
+        if (!result.contains("error")) {
+            PipeServer::get().log("VR: world scale set to " + std::to_string(new_scale));
+        }
+        res.status = result.contains("error") ? 500 : 200;
+        res.set_content(result.dump(2), "application/json");
     });
 }
 

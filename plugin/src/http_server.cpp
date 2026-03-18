@@ -22,6 +22,9 @@
 #include "routes/hook_routes.h"
 #include "routes/macro_routes.h"
 #include "routes/discovery_routes.h"
+#include "routes/process_event_routes.h"
+#include "routes/motion_controller_routes.h"
+#include "routes/timer_routes.h"
 
 #include <uevr/API.hpp>
 #include <filesystem>
@@ -143,6 +146,9 @@ void HttpServer::register_routes() {
     HookRoutes::register_routes(*m_server);
     MacroRoutes::register_routes(*m_server);
     DiscoveryRoutes::register_routes(*m_server);
+    ProcessEventRoutes::register_routes(*m_server);
+    MotionControllerRoutes::register_routes(*m_server);
+    TimerRoutes::register_routes(*m_server);
 }
 
 void HttpServer::server_thread_func() {

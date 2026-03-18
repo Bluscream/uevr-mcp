@@ -10,7 +10,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 - **Crash diagnostics built in.** Pull a single snapshot with callback health counters, breadcrumb state, plugin inventory, latest crash dump, UEVR log tail, runtime map/controller/pawn, and live render metadata.
 - **Reverse-engineer anything.** Snapshot an object's state, perform an action, diff to see what changed. Hook any UFunction to log calls, block execution, or run Lua callbacks with argument inspection. Watch properties with Lua triggers for reactive scripting.
 - **Real-time event streaming.** Poll for hook fires, watch changes, and Lua output in real time via long-polling.
-- **Works across games.** Same 112 tools work on any Unreal Engine game that UEVR supports.
+- **ProcessEvent listener.** Start/stop a global ProcessEvent hook to capture every Blueprint and native function call in real time — filter by name, ignore noisy ticks, establish baselines, and discover what the game does when you take an action. Equivalent to UEVR's Developer tab.
+- **Motion controller attachment.** Attach any actor or component to a VR controller hand with position/rotation offsets — the core mechanism for making VR mods feel native.
+- **Timer/scheduler.** Create one-shot or repeating timers that execute Lua code, with full lifecycle management (list, cancel, clear).
+- **Works across games.** Same 137 tools work on any Unreal Engine game that UEVR supports.
 
 ## Setup
 
@@ -105,12 +108,13 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 
 **`mcp-server/`** — A standalone .NET console app that speaks MCP over stdio. Translates tool calls into HTTP requests, falling back to the named pipe for status/log/game-info when HTTP is unavailable. Diagnostics tools map directly to the HTTP snapshot and per-surface diagnostics routes.
 
-## 116 MCP Tools
+## 137 MCP Tools
 
-### Object Exploration (12 tools)
+### Object Exploration (13 tools)
 
 | Tool | Description |
 |------|-------------|
+| `uevr_is_valid` | Check if a UObject pointer is still alive — returns class/name if valid |
 | `uevr_search_objects` | Search GUObjectArray by name substring |
 | `uevr_search_classes` | Search UClass objects by name |
 | `uevr_get_type` | Full type schema — all fields with types/offsets, all methods with signatures |
@@ -158,7 +162,7 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 | `uevr_get_cvar` | Read a CVar's value |
 | `uevr_set_cvar` | Set a CVar's value |
 
-### VR Controls (8 tools)
+### VR Controls (11 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -166,10 +170,31 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 | `uevr_vr_poses` | Live HMD + controller grip/aim poses and standing origin |
 | `uevr_vr_settings` | Current snap turn, aim method, decoupled pitch settings |
 | `uevr_set_vr_setting` | Change any VR setting or arbitrary mod value |
+| `uevr_vr_input` | Controller input state: joystick axes, movement orientation, OpenXR action queries |
+| `uevr_get_world_scale` | Get WorldToMetersScale from UWorld (default 100) |
+| `uevr_set_world_scale` | Set WorldToMetersScale — lower = player feels larger, higher = smaller |
 | `uevr_recenter` | Recenter the VR view |
 | `uevr_haptics` | Trigger controller vibration |
 | `uevr_save_config` | Save UEVR config to disk |
 | `uevr_reload_config` | Reload UEVR config from disk |
+
+### Motion Controller Attachment (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_attach_to_controller` | Attach an actor/component to a VR controller (left/right/HMD) with position/rotation offsets |
+| `uevr_detach_from_controller` | Detach an object from its motion controller |
+| `uevr_list_motion_controllers` | List all current motion controller attachments |
+| `uevr_clear_motion_controllers` | Remove all motion controller attachments |
+
+### Timer / Scheduler (4 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_timer_create` | Create a one-shot or looping timer that executes Lua code after a delay |
+| `uevr_timer_list` | List active timers with IDs, delays, remaining time, looping status |
+| `uevr_timer_cancel` | Cancel a timer by ID |
+| `uevr_timer_clear` | Cancel all active timers |
 
 ### Lua Scripting (9 tools)
 
@@ -308,6 +333,20 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 | `uevr_hook_log` | Get the call log for a hook — who called what and when |
 | `uevr_hook_clear` | Clear all hooks |
 
+### ProcessEvent Listener (9 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_process_event_start` | Start the global ProcessEvent listener — hooks UObject::ProcessEvent to capture all function calls in real time |
+| `uevr_process_event_stop` | Stop the listener (hook stays installed for cheap restart) |
+| `uevr_process_event_status` | Listener state: whether active, hook installed, unique functions seen, ignore list size |
+| `uevr_process_event_functions` | All tracked functions sorted by call count, with search/filter/limit/sort options |
+| `uevr_process_event_recent` | Most recent function calls (newest first) — the live stream |
+| `uevr_process_event_ignore` | Ignore functions matching a name pattern (substring) |
+| `uevr_process_event_ignore_all` | Ignore all currently seen functions — establish a clean baseline |
+| `uevr_process_event_clear` | Clear all tracked data (does not affect ignore list) |
+| `uevr_process_event_clear_ignored` | Clear the ignore list so all functions are tracked again |
+
 ### Macro System (5 tools)
 
 | Tool | Description |
@@ -348,7 +387,9 @@ But the real power is in open-ended requests. You don't need to know the game's 
 - *"Make the player glow red. Find the mesh, get its material, create a dynamic instance, crank up the emissive color."*
 - *"Figure out which animation plays when I dodge, then write a Lua script that plays it on a timer for testing."*
 - *"Find every enemy within 10 meters of me, read their health, and set them all to 1 HP."*
-- *"I want the sword to attach to my VR right hand. Find the mesh component, use Lua to set up a motion controller state, and make it track."*
+- *"Attach the sword to my right VR hand with a comfortable grip angle."*
+- *"Use the ProcessEvent listener to figure out what happens when I open a chest, then hook those functions."*
+- *"Make the world feel twice as big — adjust the VR scale."*
 
 ### Reverse engineering workflow: snapshot → action → diff
 
@@ -369,6 +410,22 @@ Combine with function hooks for complete visibility:
 2. (take damage in-game)
 3. uevr_hook_log(hookId)                              → see every call with caller info
 ```
+
+### ProcessEvent listener: discover what the game calls
+
+The ProcessEvent listener captures every Blueprint/native function call in real time — equivalent to UEVR's Developer tab:
+
+```
+1. uevr_process_event_start                         → start listening
+2. uevr_process_event_functions                      → see all functions sorted by call count
+3. uevr_process_event_ignore("Tick")                 → filter out noisy per-frame functions
+4. uevr_process_event_ignore_all                     → ignore everything seen so far
+5. uevr_process_event_clear                          → reset, then do an action in-game
+6. uevr_process_event_functions(search: "Damage")    → see only new functions that fired
+7. uevr_process_event_recent                         → live stream of the most recent calls
+```
+
+This is the fastest way to find game-specific functions. Ignore the noise, perform an action, and see exactly which functions fire.
 
 ### Live Lua scripting
 
@@ -446,7 +503,7 @@ uevr_macro_play("kill_actor", {target: "0x12345678"})
 
 ## HTTP API
 
-All 110 endpoints are accessible directly via HTTP at `http://localhost:8899/api`. Call `GET /api` for the full endpoint index. The MCP server is a thin wrapper — you can also use curl, a browser, or any HTTP client.
+All endpoints are accessible directly via HTTP at `http://localhost:8899/api`. Call `GET /api` for the full endpoint index. The MCP server is a thin wrapper — you can also use curl, a browser, or any HTTP client.
 
 The web dashboard (if present in a `web/` folder next to the DLL) is served at `http://localhost:8899/`.
 

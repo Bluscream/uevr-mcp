@@ -26,6 +26,45 @@ static void send_json(httplib::Response& res, const json& data, int status = 200
 }
 
 void register_routes(httplib::Server& server) {
+    // GET /api/explorer/is_valid — Check if a UObject pointer is still alive
+    server.Get("/api/explorer/is_valid", [](const httplib::Request& req, httplib::Response& res) {
+        auto addr_str = req.get_param_value("address");
+        if (addr_str.empty()) {
+            send_json(res, json{{"error", "Missing 'address' parameter"}}, 400);
+            return;
+        }
+
+        auto address = JsonHelpers::string_to_address(addr_str);
+        if (address == 0) {
+            send_json(res, json{{"valid", false}, {"address", addr_str}, {"reason", "Invalid address format"}});
+            return;
+        }
+
+        auto result = GameThreadQueue::get().submit_and_wait([address, addr_str]() -> json {
+            auto* obj = reinterpret_cast<uevr::API::UObject*>(address);
+            bool valid = uevr::API::UObjectHook::exists(obj);
+
+            json response = {{"valid", valid}, {"address", addr_str}};
+
+            if (valid) {
+                try {
+                    auto* cls = obj->get_class();
+                    if (cls) {
+                        auto fname = cls->get_fname();
+                        response["class"] = JsonHelpers::fname_to_string(&fname);
+                    }
+                    auto obj_fname = obj->get_fname();
+                    response["name"] = JsonHelpers::fname_to_string(&obj_fname);
+                } catch (...) {
+                    response["name"] = "unknown";
+                }
+            }
+
+            return response;
+        });
+        send_json(res, result);
+    });
+
     // GET /api/explorer/search — Search GUObjectArray by name
     server.Get("/api/explorer/search", [](const httplib::Request& req, httplib::Response& res) {
         auto query = req.get_param_value("query");
