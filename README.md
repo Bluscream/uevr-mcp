@@ -69,20 +69,55 @@ Start the game, inject UEVR, and the plugin starts automatically. The HTTP serve
 
 Prefer the one-call flow below — `uevr_setup_game` handles plugin install + process launch + backend injection + verification in a single call.
 
-### CLI mode (no MCP client required)
+### CLI / script-first mode (no MCP client required)
 
-`UevrMcpServer.exe` has a small set of positional subcommands that bypass the MCP stdio transport — useful for shell scripts, CI jobs, and smoke tests:
+`UevrMcpServer.exe` has positional subcommands that bypass the MCP stdio transport — shell scripts, CI jobs, and "I just want the dump, no AI agent" flows. Everything's documented in:
+
+- [`tools/cli-cheatsheet.md`](tools/cli-cheatsheet.md) — every verb with concrete examples
+- [`tools/dumper-mode-recipe.md`](tools/dumper-mode-recipe.md) — from zero to a full dump, copy-paste walkthrough
+- [`docs/dumper-mode.md`](docs/dumper-mode.md) — deep dive on the dumper-mode UEVR architecture
+
+Ready-made PowerShell wrappers in [`tools/`](tools/):
+
+| Script | What it does |
+|---|---|
+| `setup.ps1` | Verify deps, build plugin + MCP server, optional per-game WER registration. One-shot, idempotent. |
+| `enable-dumper-mode.ps1` / `disable-dumper-mode.ps1` | Toggle the `dumper_mode` sentinel for a specific game |
+| `quick-dump.ps1` | Full pipeline for a single game: attach → USMAP + UE project + BN/IDA bundle |
+| `enable-wer-dumps.ps1` | Register per-exe Windows Error Reporting full-memory dumps for crash diagnostics |
+| `stop-game.ps1` | Graceful close of an injected game |
+
+**Shortest path from zero to dump:**
+
+```powershell
+# 1. One-time setup
+.\tools\setup.ps1
+
+# 2. Enable dumper mode (skips UEVR render hooks — reflection-only plugins don't need them)
+.\tools\enable-dumper-mode.ps1 -GameExe "E:\SteamLibrary\steamapps\common\MyGame\...\MyGame-Win64-Shipping.exe"
+
+# 3. Launch game via Steam, wait for main menu, then:
+.\tools\quick-dump.ps1 -GameExe "E:\SteamLibrary\steamapps\common\MyGame\...\MyGame-Win64-Shipping.exe" -OutDir C:\dumps\MyGame
+```
+
+Output: `MyGame.usmap` + `MirrorProject/` (buildable UE4/UE5 project) + `REBundle/` (Binary Ninja / IDA import bundle).
+
+**Raw CLI verbs** (for custom pipelines):
 
 ```
-# Emit a UE project from a USMAP (live or Dumper-7 source)
-UevrMcpServer.exe emit-from-usmap <usmap> <outDir> <projName> <module> <engineAssoc> [gobjPath]
-
-# Run compile-check on an emitted project against a host uproject
-UevrMcpServer.exe compile-check <emittedDir> <hostUproject> [module] [maxHeaders] [headerFilter]
-
-# Plugin dev helpers
-UevrMcpServer.exe plugin-info     <gameExe>
+# Lifecycle
+UevrMcpServer.exe setup-game     <gameExe>              # install+launch+inject
+UevrMcpServer.exe attach         <gameExe>              # attach to running game (launcher-stub friendly)
+UevrMcpServer.exe stop-game      <gameExe>
+UevrMcpServer.exe plugin-info    <gameExe>
 UevrMcpServer.exe plugin-rebuild
+
+# Dumps
+UevrMcpServer.exe dump-usmap       <outPath> [filter] [compression]
+UevrMcpServer.exe dump-ue-project  <outDir> [proj] [modules] [engineAssoc] [methods:0|1] [gameContent:0|1]
+UevrMcpServer.exe dump-bn-bundle   <outDir> [filter]
+UevrMcpServer.exe emit-from-usmap  <usmap> <outDir> <proj> <module> <engineAssoc> [gobjPath]
+UevrMcpServer.exe compile-check    <emittedDir> <hostUproject> [module] [maxHeaders] [headerFilter]
 
 # Patternsleuth wrappers
 UevrMcpServer.exe ps-resolve   <exePath> [resolvers]
