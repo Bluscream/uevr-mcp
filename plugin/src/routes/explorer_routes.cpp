@@ -7,6 +7,7 @@
 #include "../reflection/property_writer.h"
 #include "../reflection/function_caller.h"
 #include "../reflection/property_probes.h"
+#include "../reflection/kismet_disasm.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -627,7 +628,29 @@ void register_routes(httplib::Server& server) {
     // entry includes status (resolved/failed/undiscovered), offset, and hit
     // count since injection.
     server.Get("/api/dump/probe_status", [](const httplib::Request&, httplib::Response& res) {
-        send_json(res, PropertyProbes::diagnostics());
+        // Merge PropertyProbes + Kismet probe diagnostics so one endpoint
+        // gives a full picture of what the self-discovery has resolved.
+        json combined = PropertyProbes::diagnostics();
+        if (combined.contains("probes") && combined["probes"].is_array()) {
+            combined["probes"].push_back(KismetDisasm::diagnostics());
+        }
+
+        // Engine-version hint. No direct version fn in UEVR API, so we infer
+        // from a couple of UE5-only class markers:
+        //  - PrimaryAssetLabel exists from UE4.25 but is more reliable on UE5
+        //  - DoubleProperty was added in UE5 (double-precision property class)
+        //  - Vector3fConst opcode (0x41) is UE5-only, but we'd need a Blueprint
+        //    to see it.
+        // Cheap and reliable: look for DoubleProperty class by name.
+        auto& api = uevr::API::get();
+        std::string version_hint = "unknown";
+        if (api) {
+            auto dprop = api->find_uobject<uevr::API::UStruct>(L"Class /Script/CoreUObject.DoubleProperty");
+            version_hint = dprop ? "UE5" : "UE4";
+        }
+        combined["engineVersionHint"] = version_hint;
+
+        send_json(res, combined);
     });
 
     // POST /api/dump/probe_reset — Clear all probe caches. After a game
@@ -635,6 +658,7 @@ void register_routes(httplib::Server& server) {
     // this forces re-discovery on the next dump.
     server.Post("/api/dump/probe_reset", [](const httplib::Request&, httplib::Response& res) {
         PropertyProbes::reset();
+        KismetDisasm::reset();
         send_json(res, json{{"ok", true}, {"reset", true}});
     });
 }

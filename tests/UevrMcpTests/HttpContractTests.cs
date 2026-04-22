@@ -159,6 +159,17 @@ public class HttpContractTests
         Assert.Empty(method.GetParameters());
     }
 
+    [Fact]
+    public void DumpBnIdaBundle_HasRequiredOutDir()
+    {
+        var method = GetTool("uevr_dump_bn_ida_bundle");
+        var ps = method.GetParameters();
+        Assert.True(ps.Length >= 1);
+        Assert.Equal("outDir", ps[0].Name);
+        Assert.Equal(typeof(string), ps[0].ParameterType);
+        Assert.False(ps[0].HasDefaultValue);
+    }
+
     // ── Player Write ──
 
     [Fact]

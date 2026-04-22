@@ -17,13 +17,13 @@ namespace UevrMcp;
 [McpServerToolType]
 public static class ExternalTools
 {
-    static readonly JsonSerializerOptions Json = new()
+    internal static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = true,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    static string? ResolveExe(string envVar, params string[] candidateBasenames)
+    internal static string? ResolveExe(string envVar, params string[] candidateBasenames)
     {
         var fromEnv = Environment.GetEnvironmentVariable(envVar);
         if (!string.IsNullOrEmpty(fromEnv) && File.Exists(fromEnv))
@@ -46,9 +46,9 @@ public static class ExternalTools
         return null;
     }
 
-    record RunResult(int ExitCode, string Stdout, string Stderr, string Command);
+    internal record RunResult(int ExitCode, string Stdout, string Stderr, string Command);
 
-    static async Task<RunResult> Run(string exe, IEnumerable<string> args, string? stdin = null, int timeoutMs = 60000)
+    internal static async Task<RunResult> Run(string exe, IEnumerable<string> args, string? stdin = null, int timeoutMs = 60000, string? cwd = null)
     {
         var psi = new ProcessStartInfo
         {
@@ -58,7 +58,9 @@ public static class ExternalTools
             RedirectStandardInput = stdin is not null,
             UseShellExecute = false,
             CreateNoWindow = true,
+            WorkingDirectory = cwd ?? Environment.CurrentDirectory,
         };
+        psi.EnvironmentVariables["NO_COLOR"] = "1";
         foreach (var a in args) psi.ArgumentList.Add(a);
 
         using var p = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start {exe}");
@@ -309,7 +311,7 @@ public static class ExternalTools
 
     // ─── helpers ────────────────────────────────────────────────────────
 
-    static IEnumerable<string> SplitArgs(string s)
+    internal static IEnumerable<string> SplitArgs(string s)
     {
         // Minimal shell-like split: respects double-quoted segments, strips quotes.
         var cur = new StringBuilder();
@@ -327,5 +329,5 @@ public static class ExternalTools
         if (cur.Length > 0) yield return cur.ToString();
     }
 
-    static string Err(string msg) => JsonSerializer.Serialize(new { ok = false, error = msg }, Json);
+    internal static string Err(string msg) => JsonSerializer.Serialize(new { ok = false, error = msg }, Json);
 }

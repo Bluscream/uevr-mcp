@@ -28,6 +28,74 @@ public static class UhtSdkTools
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
+    // ─── Engine-type exclusion list ───────────────────────────────────
+    //
+    // USMAPs from cooked games (and Dumper-7's /Script/Unknown.* naming)
+    // don't tag package origin, so the emitter can't tell whether a
+    // class is game code or just UE's built-in. When we emit e.g. AAIController
+    // into the SDK module, UHT fails with "shares engine name" because UE's
+    // own AAIController is already in AIModule.
+    //
+    // This list is the set of engine type names that have historically
+    // collided during real emits. Names are matched against the *base* type
+    // name as it appears in USMAP (without the A/U/F/E prefix on classes,
+    // because the emitter re-prefixes). Kept conservative — add more as
+    // compile-check reveals them.
+    static readonly HashSet<string> EngineTypes = new(StringComparer.Ordinal)
+    {
+        // Actors / controllers
+        "Actor", "Pawn", "Character", "Controller", "PlayerController", "AIController",
+        "GameMode", "GameModeBase", "GameState", "GameStateBase",
+        "PlayerState", "HUD", "SpectatorPawn", "DefaultPawn", "CameraActor",
+        "StaticMeshActor", "SkeletalMeshActor", "Light", "DirectionalLight",
+        "PointLight", "SpotLight", "SkyLight", "TriggerBox", "TriggerSphere",
+        "PlayerStart", "PlayerCameraManager",
+        // Components
+        "ActorComponent", "SceneComponent", "PrimitiveComponent", "StaticMeshComponent",
+        "SkeletalMeshComponent", "MeshComponent", "InstancedStaticMeshComponent",
+        "HierarchicalInstancedStaticMeshComponent", "CameraComponent",
+        "AudioComponent", "LightComponent", "PointLightComponent", "DirectionalLightComponent",
+        "SpotLightComponent", "BoxComponent", "SphereComponent", "CapsuleComponent",
+        "ShapeComponent", "CharacterMovementComponent", "ProjectileMovementComponent",
+        "MovementComponent", "PawnMovementComponent", "NavMovementComponent",
+        "ArrowComponent", "BillboardComponent", "DecalComponent", "ParticleSystemComponent",
+        "NiagaraComponent", "ChildActorComponent", "RotatingMovementComponent",
+        "SplineComponent", "InputComponent",
+        // Anim
+        "AnimInstance", "AnimBlueprintGeneratedClass", "AnimSequence", "AnimMontage",
+        "BlendSpace", "SkeletalMesh",
+        // Object / Engine core
+        "Object", "Package", "Class", "Struct", "Function", "Interface",
+        "AssetManager", "Engine", "GameEngine", "World", "Level", "GameInstance",
+        "SaveGame", "DataAsset", "DataTable", "CurveTable", "Blueprint",
+        "BlueprintGeneratedClass", "UserDefinedEnum", "UserDefinedStruct",
+        "Texture", "Texture2D", "TextureCube", "Material", "MaterialInterface",
+        "MaterialInstance", "MaterialInstanceConstant", "MaterialInstanceDynamic",
+        "StaticMesh", "PhysicalMaterial", "SoundBase", "SoundCue", "SoundWave",
+        // Widgets
+        "UserWidget", "Widget", "PanelWidget", "ContentWidget", "WidgetTree",
+        "WidgetBlueprintGeneratedClass",
+        // Struct collisions (from UHT: "Class 'UA2Pose' shares engine name 'A2Pose'
+        // with struct 'FA2Pose'")
+        "2Pose", "2CSPose", "TimerHandle", "Vector", "Vector2D", "Vector4",
+        "Rotator", "Quat", "Transform", "Color", "LinearColor", "IntPoint",
+        "IntVector", "Box", "Box2D", "Sphere", "Plane", "Matrix",
+    };
+
+    static bool IsEngineType(string name)
+    {
+        // Try raw name first — USMAP may already have stripped the prefix
+        // (e.g. "A2Pose" where the leading A is part of the name, not a prefix).
+        if (EngineTypes.Contains(name)) return true;
+        // Then try stripping a single prefix letter if the next char is upper
+        // (AAIController → AIController) or a digit (A2Pose → 2Pose — some
+        // engine structs like FA2Pose live under this shape).
+        if (name.Length >= 2 && (name[0] == 'A' || name[0] == 'U' || name[0] == 'F' || name[0] == 'E')
+            && (char.IsUpper(name[1]) || char.IsDigit(name[1])))
+            if (EngineTypes.Contains(name.Substring(1))) return true;
+        return false;
+    }
+
     // ─── CLASS_* flag bits (UE4.22+/UE5) ──────────────────────────────
     [Flags]
     enum CLASS : uint
@@ -605,6 +673,25 @@ public static class UhtSdkTools
                         paramsStr.Add((outParam ? pt + "& " : pt + " ") + Sanitize(pn));
                     }
                 }
+                // Kismet bytecode preview: for Blueprint-hosted functions (non-native
+                // with real Script bytes), emit a one-line comment listing the first
+                // few opcodes. Native functions skip this. Lets readers see what a
+                // Blueprint function actually does at the opcode level instead of
+                // staring at an empty signature.
+                if (m.TryGetProperty("scriptBytes", out var sb) && sb.ValueKind == JsonValueKind.Number)
+                {
+                    int bytes = sb.GetInt32();
+                    if (bytes > 0)
+                    {
+                        var opList = new List<string>();
+                        if (m.TryGetProperty("scriptOps", out var so) && so.ValueKind == JsonValueKind.Array)
+                            foreach (var op in so.EnumerateArray())
+                                if (op.ValueKind == JsonValueKind.String)
+                                    opList.Add(op.GetString() ?? "?");
+                        var preview = opList.Count > 0 ? string.Join(", ", opList) : "(no ops)";
+                        body.AppendLine($"    // @kismet {bytes} bytes: {preview}");
+                    }
+                }
                 body.AppendLine($"    {spec}");
                 body.AppendLine($"    {ret} {Sanitize(mname)}({string.Join(", ", paramsStr)});");
             }
@@ -658,6 +745,12 @@ public static class UhtSdkTools
         sb.AppendLine();
         sb.AppendLine("UENUM(BlueprintType)");
         sb.AppendLine($"enum class E{core} : uint8 {{");
+
+        // UHT requires a 0 entry on BlueprintType enums so default-init is
+        // valid. Bitflag enums starting at 1 trip this; we pre-emit a `None`
+        // entry when no zero value is found in the source.
+        bool hasZero = false;
+        var rowsToEmit = new List<(string Sanitized, long V, string Display)>();
         if (eObj.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
         {
             foreach (var ent in entries.EnumerateArray())
@@ -667,9 +760,15 @@ public static class UhtSdkTools
                     ? vv.GetInt64() : 0;
                 if (en.StartsWith(name + "::", StringComparison.Ordinal))
                     en = en.Substring(name.Length + 2);
-                sb.AppendLine($"    {Sanitize(en)} = {v} UMETA(DisplayName=\"{en}\"),");
+                if (v == 0) hasZero = true;
+                rowsToEmit.Add((Sanitize(en), v, en));
             }
         }
+        if (!hasZero)
+            sb.AppendLine("    None = 0 UMETA(DisplayName=\"None\"),");
+        foreach (var r in rowsToEmit)
+            sb.AppendLine($"    {r.Sanitized} = {r.V} UMETA(DisplayName=\"{r.Display}\"),");
+
         sb.AppendLine("};");
         return sb.ToString();
     }
@@ -863,12 +962,25 @@ public static class UhtSdkTools
         Directory.CreateDirectory(prvDir);
         string moduleApi = moduleName.ToUpperInvariant() + "_API";
 
-        int classes = 0, structs = 0, enums = 0;
+        int classes = 0, structs = 0, enums = 0, skipped = 0, skippedDup = 0;
+        // Track stripped-basename we've already emitted. UHT errors with
+        // "shares engine name" when two of our own types produce the same
+        // stripped name (e.g. `AHoleSpawner` class + `FHoleSpawner` struct
+        // both collapse to "HoleSpawner"). First emit wins.
+        var emittedStripped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             void EmitHeader(JsonElement t, string kind)
             {
                 var name = t.GetProperty("name").GetString() ?? "Unnamed";
+                if (IsEngineType(name)) { skipped++; return; }
+                // Internal collision check — collapsed-name must be unique.
+                var collapsed = name;
+                if (collapsed.Length >= 2
+                    && (collapsed[0] == 'A' || collapsed[0] == 'U' || collapsed[0] == 'F' || collapsed[0] == 'E' || collapsed[0] == 'I')
+                    && (char.IsUpper(collapsed[1]) || char.IsDigit(collapsed[1])))
+                    collapsed = collapsed.Substring(1);
+                if (!emittedStripped.Add(collapsed)) { skippedDup++; return; }
                 var hdr = RenderUhtHeader(t, kind, moduleApi);
                 File.WriteAllText(Path.Combine(pubDir, Sanitize(name) + ".h"), hdr);
                 if (kind == "Class") classes++; else structs++;
@@ -882,7 +994,9 @@ public static class UhtSdkTools
                 foreach (var e in eArr.EnumerateArray())
                 {
                     var name = e.GetProperty("name").GetString() ?? "Unnamed";
+                    if (IsEngineType(name)) { skipped++; continue; }
                     var core = StripUePrefix(name);
+                    if (!emittedStripped.Add(core)) { skippedDup++; continue; }
                     File.WriteAllText(Path.Combine(pubDir, "E" + Sanitize(core) + ".h"),
                         RenderUhtEnum(e));
                     enums++;
@@ -966,6 +1080,8 @@ public static class UhtSdkTools
                 moduleName,
                 classes, structs, enums,
                 totalHeaders = classes + structs + enums,
+                skippedEngineTypes = skipped,
+                skippedDuplicates = skippedDup,
             },
         }, JsonOpts);
     }

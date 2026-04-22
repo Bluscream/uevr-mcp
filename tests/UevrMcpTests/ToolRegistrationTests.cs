@@ -84,7 +84,9 @@ public class ToolRegistrationTests
         "uevr_events_poll",
         // Discovery tools (6)
         "uevr_subclasses", "uevr_search_names", "uevr_delegates",
-        "uevr_vtable", "uevr_pattern_scan", "uevr_all_children"
+        "uevr_vtable", "uevr_pattern_scan", "uevr_all_children",
+        // Reverse-engineering bundle (1)
+        "uevr_dump_bn_ida_bundle"
     };
 
     static List<(string Name, MethodInfo Method)> DiscoverTools()
@@ -115,10 +117,10 @@ public class ToolRegistrationTests
     }
 
     [Fact]
-    public void TotalToolCount_Is112()
+    public void TotalToolCount_Is113()
     {
         var tools = DiscoverTools();
-        Assert.Equal(112, tools.Count);
+        Assert.Equal(113, tools.Count);
     }
 
     [Fact]

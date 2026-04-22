@@ -2,6 +2,7 @@
 #include "property_reader.h"
 #include "function_caller.h"
 #include "property_probes.h"
+#include "kismet_disasm.h"
 #include "../json_helpers.h"
 
 #include <algorithm>
@@ -431,6 +432,22 @@ static json enumerate_own_methods(API::UStruct* ustruct) {
         // Phase 4: UFunction::FunctionFlags — UEVR already exposes this. Decoded
         // server-side into UFUNCTION(BlueprintCallable, Server, ...) specifiers.
         m["functionFlags"] = func->get_function_flags();
+
+        // Kismet bytecode preview. Blueprint-hosted functions carry a TArray<uint8>
+        // Script buffer; native-only C++ functions have it empty. Probed offset
+        // (UE4.22–UE5.5). We emit byte count unconditionally + opcode mnemonic
+        // list so the emitter can render non-trivial Blueprint bodies as a
+        // "// bytecode: OP1, OP2, ..." comment instead of an empty stub.
+        auto sv = KismetDisasm::get_function_script(func);
+        if (sv.valid()) {
+            m["scriptBytes"] = sv.size;
+            auto ops = KismetDisasm::disassemble(sv, 32);
+            if (!ops.empty()) {
+                json ja = json::array();
+                for (auto& s : ops) ja.push_back(s);
+                m["scriptOps"] = ja;
+            }
+        }
         methods.push_back(m);
     }
     return methods;

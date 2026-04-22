@@ -140,6 +140,7 @@ struct PHOENIX_API FSpellData {
 | `uevr_dump_uht_sdk` | UHT-style single-dir headers with `UCLASS / USTRUCT / UPROPERTY` macros and forward decls. Use as input to your own editor project. |
 | `uevr_dump_ue_project` | **Full UE project** — `.uproject`, `Target.cs`, per-module `Build.cs`, `Public/*.h`, `Private/<Module>.cpp`. The jmap-equivalent. |
 | `uevr_dump_reflection_json` | Raw structured JSON of every class, struct, enum with fields, offsets, property flags, tags. Feed it into your own generator. |
+| `uevr_dump_bn_ida_bundle` | Reverse-engineering bundle for Binary Ninja + IDA Pro: emits a Binary Ninja-friendly `.jmap`, a parser-friendly local-type header, import scripts for both tools, and a README with usage notes. |
 | `uevr_dump_usmap_selftest` | Emit a synthetic fixture USMAP covering every tag variant — no game required. Pair with `uevr_validate_usmap` for round-trip testing. |
 | `uevr_dump_cache_status` / `uevr_dump_cache_clear` | Inspect / invalidate the per-session reflection-walk cache. Consecutive dump calls with the same filter share one walk. |
 
