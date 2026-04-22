@@ -770,6 +770,137 @@ public static class UhtSdkTools
 
     // ─── uevr_dump_ue_project ──────────────────────────────────────────
 
+    // Internal seam for USMAP-driven project scaffolding. Takes a pre-built
+    // reflection JSON (adapted from jmap's USMAP output) and emits the same
+    // project tree that DumpUeProject produces against live reflection.
+    // All types collapse into one module since USMAP doesn't carry the
+    // /Script/<Module> origin.
+    internal static string EmitUhtProjectFromReflection(JsonElement root,
+        string outDir, string projectName, string moduleName, string engineAssociation)
+    {
+        var superMap = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (root.TryGetProperty("classes", out var clsArr))
+            foreach (var c in clsArr.EnumerateArray())
+                if (c.TryGetProperty("super", out var sp) && sp.ValueKind == JsonValueKind.String
+                    && sp.GetString() is string s)
+                    superMap[c.GetProperty("name").GetString() ?? ""] = s;
+        _superMap = superMap;
+
+        Directory.CreateDirectory(outDir);
+        var modDir = Path.Combine(outDir, "Source", moduleName);
+        var pubDir = Path.Combine(modDir, "Public");
+        var prvDir = Path.Combine(modDir, "Private");
+        Directory.CreateDirectory(pubDir);
+        Directory.CreateDirectory(prvDir);
+        string moduleApi = moduleName.ToUpperInvariant() + "_API";
+
+        int classes = 0, structs = 0, enums = 0;
+        try
+        {
+            void EmitHeader(JsonElement t, string kind)
+            {
+                var name = t.GetProperty("name").GetString() ?? "Unnamed";
+                var hdr = RenderUhtHeader(t, kind, moduleApi);
+                File.WriteAllText(Path.Combine(pubDir, Sanitize(name) + ".h"), hdr);
+                if (kind == "Class") classes++; else structs++;
+            }
+            if (root.TryGetProperty("classes", out var c2))
+                foreach (var cls in c2.EnumerateArray()) EmitHeader(cls, "Class");
+            if (root.TryGetProperty("structs", out var s2))
+                foreach (var st in s2.EnumerateArray()) EmitHeader(st, "ScriptStruct");
+            if (root.TryGetProperty("enums", out var eArr))
+            {
+                foreach (var e in eArr.EnumerateArray())
+                {
+                    var name = e.GetProperty("name").GetString() ?? "Unnamed";
+                    var core = StripUePrefix(name);
+                    File.WriteAllText(Path.Combine(pubDir, "E" + Sanitize(core) + ".h"),
+                        RenderUhtEnum(e));
+                    enums++;
+                }
+            }
+
+            // Minimal Build.cs, module stub, target + uproject — same templates
+            // as DumpUeProject but with a single module.
+            var build = new StringBuilder();
+            build.AppendLine("using UnrealBuildTool;");
+            build.AppendLine();
+            build.AppendLine($"public class {moduleName} : ModuleRules {{");
+            build.AppendLine($"    public {moduleName}(ReadOnlyTargetRules Target) : base(Target) {{");
+            build.AppendLine("        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;");
+            build.AppendLine();
+            build.AppendLine("        PublicDependencyModuleNames.AddRange(new string[] {");
+            build.AppendLine("            \"Core\", \"CoreUObject\", \"Engine\", \"InputCore\", \"UMG\",");
+            build.AppendLine("            \"SlateCore\", \"Slate\", \"AIModule\", \"GameplayTags\"");
+            build.AppendLine("        });");
+            build.AppendLine("    }");
+            build.AppendLine("}");
+            File.WriteAllText(Path.Combine(modDir, moduleName + ".Build.cs"), build.ToString());
+
+            var modCpp = new StringBuilder();
+            modCpp.AppendLine($"// Auto-generated module stub for {moduleName}.");
+            modCpp.AppendLine("#include \"Modules/ModuleManager.h\"");
+            modCpp.AppendLine();
+            modCpp.AppendLine($"IMPLEMENT_MODULE(FDefaultGameModuleImpl, {moduleName});");
+            File.WriteAllText(Path.Combine(prvDir, moduleName + ".cpp"), modCpp.ToString());
+
+            string targetCs(string name, string type) => $$"""
+                using UnrealBuildTool;
+                using System.Collections.Generic;
+
+                public class {{name}} : TargetRules
+                {
+                    public {{name}}(TargetInfo Target) : base(Target)
+                    {
+                        Type = TargetType.{{type}};
+                        DefaultBuildSettings = BuildSettingsVersion.V2;
+                        ExtraModuleNames.AddRange(new string[] { "{{moduleName}}" });
+                    }
+                }
+                """;
+            File.WriteAllText(Path.Combine(outDir, "Source", projectName + ".Target.cs"),
+                targetCs(projectName + "Target", "Game"));
+            File.WriteAllText(Path.Combine(outDir, "Source", projectName + "Editor.Target.cs"),
+                targetCs(projectName + "EditorTarget", "Editor"));
+
+            var uproject = $$"""
+            {
+                "FileVersion": 3,
+                "EngineAssociation": "{{engineAssociation}}",
+                "Category": "",
+                "Description": "Generated from USMAP via UEVR-MCP uevr_dump_uht_from_usmap.",
+                "Modules": [
+                    {
+                        "Name": "{{moduleName}}",
+                        "Type": "Runtime",
+                        "LoadingPhase": "Default",
+                        "AdditionalDependencies": [ "Engine", "CoreUObject" ]
+                    }
+                ]
+            }
+            """;
+            File.WriteAllText(Path.Combine(outDir, projectName + ".uproject"), uproject);
+        }
+        finally
+        {
+            _superMap = null;
+            _referencedClasses = null;
+            _referencedStructs = null;
+            _referencedEnums = null;
+        }
+
+        return JsonSerializer.Serialize(new {
+            ok = true,
+            data = new {
+                projectRoot = Path.GetFullPath(outDir),
+                projectName,
+                moduleName,
+                classes, structs, enums,
+                totalHeaders = classes + structs + enums,
+            },
+        }, JsonOpts);
+    }
+
     [McpServerTool(Name = "uevr_dump_ue_project")]
     [Description("Scaffold a buildable UE4/UE5 editor project from live reflection. Groups types by their /Script/<Module>/ module name, emits per-module Source/<Module>/{Public,Private}/ with UHT headers + .Build.cs + module stub .cpp, plus a root .uproject and two .Target.cs files. Matches jmap_to_uht.py's project shape. Types whose fullName doesn't start with /Script/ (BP assets under /Game/) are skipped. Opens a ready-to-compile mirror project — drop into UE editor.")]
     public static async Task<string> DumpUeProject(
