@@ -91,7 +91,9 @@ if (-not $SkipServerBuild) {
     Push-Location (Join-Path $RepoRoot 'mcp-server')
     try {
         $out = dotnet build -c Release 2>&1
-        $errors = $out | Select-String -Pattern 'error' -SimpleMatch | Select-Object -First 3
+        # Match actual MSBuild errors (CSnnnn, MSBnnnn, NETSDKnnnn) — NOT the
+        # "0 Error(s)" summary line which would false-positive on SimpleMatch.
+        $errors = $out | Select-String -Pattern 'error\s+(CS|MSB|NETSDK|NU)\d+' | Select-Object -First 3
         if ($errors) {
             Write-Host "BUILD FAILED:" -ForegroundColor Red
             $errors | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
@@ -99,7 +101,10 @@ if (-not $SkipServerBuild) {
         }
         $Exe = Join-Path (Get-Location) 'bin\Release\net9.0\UevrMcpServer.exe'
         if (Test-Path $Exe) {
-            Write-Host "  OK: $Exe" -ForegroundColor Green
+            $size = [int]((Get-Item $Exe).Length / 1KB)
+            Write-Host "  OK: $Exe ($size KB)" -ForegroundColor Green
+        } else {
+            throw "Build reported no errors but $Exe is missing"
         }
     } finally {
         Pop-Location
