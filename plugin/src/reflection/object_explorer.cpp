@@ -428,6 +428,9 @@ static json enumerate_own_methods(API::UStruct* ustruct) {
         m["params"] = params;
         if (!return_type.empty()) m["returnType"] = return_type;
         if (auto on = ustruct->get_fname()) m["owner"] = JsonHelpers::wide_to_utf8(on->to_string());
+        // Phase 4: UFunction::FunctionFlags — UEVR already exposes this. Decoded
+        // server-side into UFUNCTION(BlueprintCallable, Server, ...) specifiers.
+        m["functionFlags"] = func->get_function_flags();
         methods.push_back(m);
     }
     return methods;
@@ -1360,6 +1363,34 @@ static void dump_range(int begin, int end,
             if (super->get_fname()) {
                 t["super"] = JsonHelpers::wide_to_utf8(super->get_fname()->to_string());
             }
+        }
+
+        // Phase 4: UClass-only metadata — classFlags, classConfigName, classWithin,
+        // interfaces[]. ScriptStructs don't have any of these. Struct* can be cast
+        // blind because we classified this as `is_class` already.
+        if (is_class) {
+            try {
+                uint32_t cflags = PropertyProbes::get_class_flags(ustruct);
+                if (cflags != 0) t["classFlags"] = cflags;
+                auto cfg = PropertyProbes::get_class_config_name(ustruct);
+                if (!cfg.empty() && cfg != L"None")
+                    t["classConfigName"] = JsonHelpers::wide_to_utf8(cfg);
+                if (auto within = PropertyProbes::get_class_within(ustruct)) {
+                    if (within->get_fname()) {
+                        auto wname = JsonHelpers::wide_to_utf8(within->get_fname()->to_string());
+                        if (wname != "Object") t["classWithin"] = wname;
+                    }
+                }
+                auto ifaces = PropertyProbes::get_interfaces(ustruct);
+                if (!ifaces.empty()) {
+                    json arr = json::array();
+                    for (auto* ic : ifaces) {
+                        if (ic && ic->get_fname())
+                            arr.push_back(JsonHelpers::wide_to_utf8(ic->get_fname()->to_string()));
+                    }
+                    if (!arr.empty()) t["interfaces"] = arr;
+                }
+            } catch (...) { /* probes are best-effort */ }
         }
 
         // Emit "own" fields only (not walking supers) so USMAP schemas are correctly

@@ -28,6 +28,55 @@ public static class UhtSdkTools
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
+    // ─── CLASS_* flag bits (UE4.22+/UE5) ──────────────────────────────
+    [Flags]
+    enum CLASS : uint
+    {
+        Abstract                = 0x00000001,
+        DefaultConfig           = 0x00000002,
+        Config                  = 0x00000004,
+        Transient               = 0x00000008,
+        ProjectUserConfig       = 0x00000040,
+        Native                  = 0x00000080,
+        NotPlaceable            = 0x00000200,
+        PerObjectConfig         = 0x00000400,
+        EditInlineNew           = 0x00001000,
+        CollapseCategories      = 0x00002000,
+        Interface               = 0x00004000,
+        Const                   = 0x00010000,
+        CompiledFromBlueprint   = 0x00040000,
+        MinimalAPI              = 0x00080000,
+        DefaultToInstanced      = 0x00200000,
+        Hidden                  = 0x01000000,
+        Deprecated              = 0x02000000,
+        HideDropDown            = 0x04000000,
+        GlobalUserConfig        = 0x08000000,
+    }
+
+    // ─── FUNC_* flag bits ──────────────────────────────────────────────
+    [Flags]
+    enum FUNC : uint
+    {
+        Final                  = 0x00000001,
+        RequiredAPI            = 0x00000002,
+        BlueprintAuthorityOnly = 0x00000004,
+        BlueprintCosmetic      = 0x00000008,
+        Net                    = 0x00000040,
+        NetReliable            = 0x00000080,
+        Exec                   = 0x00000200,
+        Native                 = 0x00000400,
+        Event                  = 0x00000800,
+        Static                 = 0x00002000,
+        NetMulticast           = 0x00004000,
+        NetServer              = 0x00200000,
+        NetClient              = 0x01000000,
+        BlueprintCallable      = 0x04000000,
+        BlueprintEvent         = 0x08000000,
+        BlueprintPure          = 0x10000000,
+        EditorOnly             = 0x20000000,
+        Const                  = 0x40000000,
+    }
+
     // ─── CPF_* flag bits ────────────────────────────────────────────────
     // Stable across UE4.22–UE5.4 (new flags appended, existing flags unchanged).
     [Flags]
@@ -120,6 +169,63 @@ public static class UhtSdkTools
         return parts.Count == 0 ? "UPROPERTY()" : "UPROPERTY(" + string.Join(", ", parts) + ")";
     }
 
+    // ─── UCLASS specifier derivation ───────────────────────────────────
+    //
+    // Builds "UCLASS(Abstract, BlueprintType, Config=Game, ...)" from the
+    // raw ClassFlags bits plus ClassConfigName/ClassWithin/interfaces.
+
+    static string UClassSpecifier(CLASS flags, string? configName)
+    {
+        var parts = new List<string>();
+        if ((flags & CLASS.Abstract)             != 0) parts.Add("Abstract");
+        if ((flags & CLASS.Deprecated)           != 0) parts.Add("Deprecated");
+        if ((flags & CLASS.Hidden)               != 0) parts.Add("Hidden");
+        if ((flags & CLASS.HideDropDown)         != 0) parts.Add("HideDropDown");
+        if ((flags & CLASS.NotPlaceable)         != 0) parts.Add("NotPlaceable");
+        if ((flags & CLASS.EditInlineNew)        != 0) parts.Add("EditInlineNew");
+        if ((flags & CLASS.DefaultToInstanced)   != 0) parts.Add("DefaultToInstanced");
+        if ((flags & CLASS.CollapseCategories)   != 0) parts.Add("CollapseCategories");
+        if ((flags & CLASS.Transient)            != 0) parts.Add("Transient");
+        if ((flags & CLASS.PerObjectConfig)      != 0) parts.Add("PerObjectConfig");
+        if ((flags & CLASS.MinimalAPI)           != 0) parts.Add("MinimalAPI");
+        // Config modifier family — pick the most specific one UHT expects.
+        if ((flags & CLASS.GlobalUserConfig)     != 0) parts.Add("GlobalUserConfig");
+        else if ((flags & CLASS.ProjectUserConfig) != 0) parts.Add("ProjectUserConfig");
+        else if ((flags & CLASS.DefaultConfig)   != 0) parts.Add("DefaultConfig");
+        if ((flags & CLASS.Config) != 0 && !string.IsNullOrEmpty(configName) && configName != "None")
+            parts.Add($"Config={configName}");
+        // Always emit BlueprintType so BP can see this class (matches jmap's
+        // default). Users can strip manually if a class really shouldn't expose.
+        parts.Add("BlueprintType");
+        return "UCLASS(" + string.Join(", ", parts) + ")";
+    }
+
+    // ─── UFUNCTION specifier derivation ────────────────────────────────
+
+    static string UFunctionSpecifier(FUNC flags)
+    {
+        var parts = new List<string>();
+        // BP access decoder tree — mirrors UHT's precedence.
+        bool bpEvent       = (flags & FUNC.BlueprintEvent) != 0;
+        bool isNative      = (flags & FUNC.Native)         != 0;
+        bool isEvent       = (flags & FUNC.Event)          != 0;
+        if (bpEvent && !isNative)       parts.Add("BlueprintImplementableEvent");
+        else if (bpEvent && isNative)   parts.Add("BlueprintNativeEvent");
+        if ((flags & FUNC.BlueprintPure)     != 0) parts.Add("BlueprintPure");
+        else if ((flags & FUNC.BlueprintCallable) != 0) parts.Add("BlueprintCallable");
+        if ((flags & FUNC.BlueprintAuthorityOnly) != 0) parts.Add("BlueprintAuthorityOnly");
+        if ((flags & FUNC.BlueprintCosmetic) != 0) parts.Add("BlueprintCosmetic");
+        if ((flags & FUNC.Exec)         != 0) parts.Add("Exec");
+        if ((flags & FUNC.EditorOnly)   != 0) parts.Add("CallInEditor");
+        // Networking.
+        if ((flags & FUNC.NetServer)    != 0) parts.Add("Server");
+        if ((flags & FUNC.NetClient)    != 0) parts.Add("Client");
+        if ((flags & FUNC.NetMulticast) != 0) parts.Add("NetMulticast");
+        if ((flags & FUNC.Net) != 0 && (flags & FUNC.NetReliable) != 0) parts.Add("Reliable");
+        if ((flags & FUNC.Net) != 0 && (flags & FUNC.NetReliable) == 0) parts.Add("Unreliable");
+        return parts.Count == 0 ? "UFUNCTION()" : "UFUNCTION(" + string.Join(", ", parts) + ")";
+    }
+
     // ─── Type rendering (UHT flavor) ───────────────────────────────────
     //
     // Uses UE4-style short names: int32, uint8, bool, FString, FName, FText.
@@ -167,6 +273,42 @@ public static class UhtSdkTools
         if (sb.Length == 0 || char.IsDigit(sb[0])) sb.Insert(0, '_');
         return sb.ToString();
     }
+
+    // Map a raw FProperty class name ("IntProperty", "FloatProperty", etc.) to
+    // a UHT-style C++ type string. Used for method parameter/return types
+    // when we don't have a recursive tag (methods come from enumerate_methods
+    // which flattens type info).
+    static string MapPropertyTypeToUht(string? raw) => raw switch
+    {
+        null            => "void",
+        "IntProperty"   => "int32",
+        "FloatProperty" => "float",
+        "DoubleProperty"=> "double",
+        "BoolProperty"  => "bool",
+        "ByteProperty"  => "uint8",
+        "Int8Property"  => "int8",
+        "Int16Property" => "int16",
+        "UInt16Property"=> "uint16",
+        "UInt32Property"=> "uint32",
+        "Int64Property" => "int64",
+        "UInt64Property"=> "uint64",
+        "NameProperty"  => "FName",
+        "StrProperty"   => "FString",
+        "TextProperty"  => "FText",
+        "ObjectProperty" or "WeakObjectProperty" or "LazyObjectProperty"
+            or "SoftObjectProperty" or "AssetObjectProperty" or "ClassProperty"
+            or "SoftClassProperty" or "InterfaceProperty"
+                          => "UObject*",
+        "ArrayProperty" => "TArray<uint8>",
+        "MapProperty"   => "TMap<FName, uint8>",
+        "SetProperty"   => "TSet<uint8>",
+        "StructProperty" => "uint8 /*struct*/",
+        "EnumProperty"   => "uint8 /*enum*/",
+        "DelegateProperty" or "MulticastDelegateProperty"
+            or "MulticastInlineDelegateProperty" or "MulticastSparseDelegateProperty"
+                          => "void*",
+        _                => "uint8",
+    };
 
     // Strip a UE C++ type prefix (A/U/I/F/E) if and only if the second char
     // is uppercase. "AActor" -> "Actor" but "AnimMontage" stays "AnimMontage"
@@ -305,8 +447,29 @@ public static class UhtSdkTools
             var pref = Prefix(core);
             var superCore = string.IsNullOrEmpty(super) ? "Object" : Sanitize(StripUePrefix(super!));
             var superPref = string.IsNullOrEmpty(super) ? "U" : Prefix(superCore);
-            body.AppendLine("UCLASS(BlueprintType)");
-            body.AppendLine($"class {apiMacro}{pref}{core} : public {superPref}{superCore} {{");
+
+            // Phase 4: UCLASS flags + ClassConfigName + interfaces.
+            uint cflags = t.TryGetProperty("classFlags", out var cf) && cf.ValueKind == JsonValueKind.Number
+                ? cf.GetUInt32() : 0u;
+            string? configName = t.TryGetProperty("classConfigName", out var cn) ? cn.GetString() : null;
+            body.AppendLine(UClassSpecifier((CLASS)cflags, configName));
+
+            // Build inheritance list: super + interfaces.
+            var inherits = new List<string> { $"public {superPref}{superCore}" };
+            if (t.TryGetProperty("interfaces", out var ifacesEl) && ifacesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var i in ifacesEl.EnumerateArray())
+                {
+                    var iname = i.GetString();
+                    if (string.IsNullOrEmpty(iname)) continue;
+                    _referencedClasses?.Add(iname);
+                    // Interface UE classes are named with a "U"-prefix UClass + "I"-prefix C++ class.
+                    // The C++ inheritance target is the I-prefix form.
+                    var icore = Sanitize(StripUePrefix(iname));
+                    inherits.Add($"public I{icore}");
+                }
+            }
+            body.AppendLine($"class {apiMacro}{pref}{core} : {string.Join(", ", inherits)} {{");
             body.AppendLine("    GENERATED_BODY()");
             body.AppendLine("public:");
         }
@@ -337,6 +500,44 @@ public static class UhtSdkTools
                 body.AppendLine($"    {spec}");
                 body.AppendLine($"    {uhtType} {Sanitize(fname)};  // +0x{offset:X}");
                 body.AppendLine();
+            }
+        }
+
+        // Phase 4: emit method declarations with UFUNCTION specifiers if the
+        // dump included methods. Parameters are rendered with their raw type
+        // names (UE's FName for each param's property class) — good enough
+        // for UHT to compile when the types are in scope.
+        if (t.TryGetProperty("methods", out var methodsEl) && methodsEl.ValueKind == JsonValueKind.Array
+            && methodsEl.GetArrayLength() > 0)
+        {
+            body.AppendLine();
+            body.AppendLine("    // ── Methods ──");
+            foreach (var m in methodsEl.EnumerateArray())
+            {
+                var owner = m.TryGetProperty("owner", out var mo) ? mo.GetString() : null;
+                if (!string.IsNullOrEmpty(owner) && owner != name) continue;
+
+                var mname = m.GetProperty("name").GetString() ?? "Unnamed";
+                uint fflags = m.TryGetProperty("functionFlags", out var ff) && ff.ValueKind == JsonValueKind.Number
+                    ? ff.GetUInt32() : 0u;
+                var spec = UFunctionSpecifier((FUNC)fflags);
+                var ret = m.TryGetProperty("returnType", out var rt) ? rt.GetString() : "void";
+                // Map raw "IntProperty" -> "int32" via our existing helper.
+                ret = MapPropertyTypeToUht(ret);
+
+                var paramsStr = new List<string>();
+                if (m.TryGetProperty("params", out var ps) && ps.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var p in ps.EnumerateArray())
+                    {
+                        var pn = p.GetProperty("name").GetString() ?? "p";
+                        var pt = MapPropertyTypeToUht(p.GetProperty("type").GetString() ?? "uint8");
+                        bool outParam = p.TryGetProperty("out", out var op) && op.GetBoolean();
+                        paramsStr.Add((outParam ? pt + "& " : pt + " ") + Sanitize(pn));
+                    }
+                }
+                body.AppendLine($"    {spec}");
+                body.AppendLine($"    {ret} {Sanitize(mname)}({string.Join(", ", paramsStr)});");
             }
         }
 
