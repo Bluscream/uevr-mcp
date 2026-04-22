@@ -138,7 +138,7 @@ public static class ExternalTools
     {
         var exe = ResolveExe("PATTERNSLEUTH_EXE", "patternsleuth.exe", "patternsleuth");
         if (exe is null)
-            return Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
 
         var argList = SplitArgs(args).ToList();
 

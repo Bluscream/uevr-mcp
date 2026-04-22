@@ -28,6 +28,23 @@ struct ProbeCache {
 static ProbeCache g_cache;
 static std::mutex g_discovery_mutex;
 
+// Multi-function consensus state. Per-candidate votes accumulate across probe
+// attempts. An offset is committed when either:
+//   - it scores kOffsetValid on any single function (definitive — a populated
+//     Script with a valid EX_* first byte can't be coincidence), OR
+//   - after N probe attempts (kMinProbesForConsensus), one offset is uniquely
+//     consistent (all-empty, never rejected) while at least one OTHER offset
+//     has been rejected. This handles fully-native games where no UFunction
+//     has populated Script.
+struct CandidateVotes {
+    uint32_t valid = 0;   // count>0 with valid first byte
+    uint32_t empty = 0;   // count=0, plausible TArray shape
+    uint32_t reject = 0;  // impossible — count out of range, etc.
+};
+static CandidateVotes g_votes[16]; // parallel to kScriptOffsetCandidates
+static uint32_t g_probes_attempted = 0;
+static const uint32_t kMinProbesForConsensus = 32;
+
 // ── SEH primitives (no C++ objects in these frames) ────────────────
 
 static bool page_readable(const void* p, size_t size) noexcept
@@ -64,25 +81,31 @@ static bool seh_read_ptr(const void* src, void** dst) noexcept
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ── Probe UFunction::Script offset ─────────────────────────────────
+// ── Probe UStruct::Script offset ──────────────────────────────────
 //
-// Anchor: Script immediately follows `Func` (a native fn pointer, always
-// non-null — points at e.g. ProcessInternal for Blueprint-hosted funcs or
-// the native stub for C++ funcs). We scan candidate offsets until we find a
-// pointer-aligned slot whose value points into executable memory, then read
-// the next 16 bytes as a plausible TArray<uint8>. Offset of the TArray is
-// `func_ptr_offset + 8`.
+// Script is a UStruct member (NOT a UFunction-specific one): confirmed in
+// UE 4.26 + UE 5.5 Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h.
+// Layout on any UStruct subclass (UClass, UScriptStruct, UFunction):
 //
-// Candidate range covers UE4.22–UE5.5. UE5 with editor-only bits moves
-// things around by ~0x20 vs cooked UE4.
+//   [UObject      0x00 .. 0x28]
+//   [UField::Next 0x28 .. 0x30]
+//   [FStructBaseChain (StructBaseChainArray* + NumStructBasesInChainMinusOne + pad)
+//                 0x30 .. 0x40]  (present when USTRUCT_FAST_ISCHILDOF_IMPL ==
+//                                 USTRUCT_ISCHILDOF_STRUCTARRAY, the default)
+//   [SuperStruct          0x40 .. 0x48]
+//   [Children             0x48 .. 0x50]
+//   [ChildProperties      0x50 .. 0x58]
+//   [PropertiesSize + MinAlignment (2x int32)  0x58 .. 0x60]
+//   [Script TArray<uint8>  0x60 .. 0x70]  ← canonical offset on UE 4.26+
 //
-// UFunction base size in UE is roughly 0xB0 (UStruct + function-specific
-// fields + Func). The Script TArray starts right after Func.
+// Stripped-shipping builds (no editor-only fields) keep this layout stable
+// across UE 4.22–5.5. The probe scans a handful of candidates around 0x60
+// to absorb non-standard UE builds (Stellar Blade-style forks), then locks
+// the first offset where the TArray shape passes AND data[0] is a valid
+// EX_* opcode when non-empty.
 
-static const int32_t kFuncPtrRange[] = {
-    0x70, 0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8,
-    0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0,
-    0xF8, 0x100, 0x108, 0x110, 0x118, 0x120
+static const int32_t kScriptOffsetCandidates[] = {
+    0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80
 };
 
 // Validate data[0] is a plausible EX_* opcode. Real UE bytecode starts in
@@ -107,40 +130,104 @@ static bool is_plausible_bytecode(const void* data, int32_t size) noexcept
     return b0 < 0x80;
 }
 
+// Evaluate one candidate offset on a single UFunction. Returns:
+//   kOffsetReject   — shape invalid (count out of range, capacity mismatch,
+//                     unreadable data pointer, or count>0 with non-EX_* first byte)
+//   kOffsetEmpty    — shape plausible, count=0 (no information — could be any
+//                     offset that happens to contain zeros)
+//   kOffsetValid    — shape plausible, count>0, and data[0] is a valid EX_ opcode
+static constexpr int kOffsetReject = -1;
+static constexpr int kOffsetEmpty  =  0;
+static constexpr int kOffsetValid  =  1;
+
+static int evaluate_candidate(void* struct_base, int32_t off) noexcept
+{
+    auto addr = reinterpret_cast<uint8_t*>(struct_base) + off;
+    if (!page_readable(addr, sizeof(TArrayLike))) return kOffsetReject;
+
+    TArrayLike arr{};
+    if (!seh_read_tarray(addr, &arr)) return kOffsetReject;
+
+    if (arr.count < 0 || arr.count > 0x100000) return kOffsetReject;
+    if (arr.count > arr.capacity) return kOffsetReject;
+
+    // Even for empty TArrays, the data field must be either null or a
+    // readable heap pointer. This rejects offsets where the bytes at
+    // [off, off+8) are actually small-int fields packed as a fake pointer
+    // (e.g. UStruct PropertiesSize + MinAlignment = two int32s). Their
+    // combined value is a small number (<0x10000000000) that VirtualQuery
+    // rejects as unmapped. This is the key discriminator that separates
+    // Script (empty → data=nullptr) from ChildProperties-adjacent reads
+    // (empty → data=small-int-garbage).
+    if (arr.data != nullptr && !page_readable(arr.data, 1)) return kOffsetReject;
+
+    if (arr.count == 0) {
+        // Shape plausible (data null or readable, counts consistent).
+        return kOffsetEmpty;
+    }
+    if (!arr.data) return kOffsetReject;
+    if (!page_readable(arr.data, static_cast<size_t>(arr.count))) return kOffsetReject;
+    if (!is_plausible_bytecode(arr.data, arr.count)) return kOffsetReject;
+    return kOffsetValid;
+}
+
+// Multi-call consensus probe. Records per-candidate votes across many
+// UFunction probe attempts, commits an offset once we have a definitive
+// answer (any valid non-empty Script) or strong consensus (N probes with
+// one offset uniquely plausible while another offset was rejected).
+//
+// Returns:
+//   >= 0 : offset resolved (commit to cache)
+//   -1   : deferred, probe again next call
+//   -2   : cannot resolve — no offset is plausible after enough attempts
 static int32_t probe_script_offset(void* func_base) noexcept
 {
-    for (int32_t off : kFuncPtrRange) {
-        auto addr = reinterpret_cast<uint8_t*>(func_base) + off;
-        if (!page_readable(addr, sizeof(void*))) continue;
+    g_probes_attempted++;
 
-        void* candidate = nullptr;
-        if (!seh_read_ptr(addr, &candidate)) continue;
-        if (!candidate) continue;
-        if (!page_executable(candidate)) continue;
+    int any_valid_off = -1;
+    constexpr size_t N = sizeof(kScriptOffsetCandidates) / sizeof(kScriptOffsetCandidates[0]);
+    static_assert(N <= sizeof(g_votes) / sizeof(g_votes[0]), "votes array too small");
 
-        // Read next 16 bytes as plausible TArray<uint8>.
-        int32_t script_off = off + static_cast<int32_t>(sizeof(void*));
-        auto script_addr = reinterpret_cast<uint8_t*>(func_base) + script_off;
-        if (!page_readable(script_addr, sizeof(TArrayLike))) continue;
-
-        TArrayLike arr{};
-        if (!seh_read_tarray(script_addr, &arr)) continue;
-
-        // Plausible TArray<uint8>: either empty (native function) or small-ish
-        // bytecode buffer. 0–1MB is a generous cap — real BP bytecode is rarely
-        // above a few KB per function.
-        if (arr.count < 0 || arr.count > 0x100000) continue;
-        if (arr.count > arr.capacity) continue;
-        if (arr.count > 0) {
-            if (!arr.data) continue;
-            if (!page_readable(arr.data, static_cast<size_t>(arr.count))) continue;
-            // First-byte validity: reject if not a known EX_ opcode range.
-            if (!is_plausible_bytecode(arr.data, arr.count)) continue;
+    for (size_t i = 0; i < N; ++i) {
+        int32_t off = kScriptOffsetCandidates[i];
+        int verdict = evaluate_candidate(func_base, off);
+        if (verdict == kOffsetValid) {
+            g_votes[i].valid++;
+            if (any_valid_off < 0) any_valid_off = off;
+        } else if (verdict == kOffsetEmpty) {
+            g_votes[i].empty++;
+        } else {
+            g_votes[i].reject++;
         }
-
-        return script_off;
     }
-    return -2;
+
+    // Definitive win: any candidate with a populated Script + valid opcode.
+    if (any_valid_off >= 0) return any_valid_off;
+
+    // Consensus path. After kMinProbesForConsensus attempts, pick the
+    // candidate with the most empties and zero rejects, tie-broken by
+    // first-wins. Require at least ONE other candidate to have seen rejects
+    // (otherwise we can't distinguish a real Script from random empty memory).
+    if (g_probes_attempted >= kMinProbesForConsensus) {
+        int best_idx = -1;
+        uint32_t best_empty = 0;
+        bool any_rejected = false;
+        for (size_t i = 0; i < N; ++i) {
+            if (g_votes[i].reject > 0) any_rejected = true;
+            if (g_votes[i].reject == 0 && g_votes[i].empty > best_empty) {
+                best_empty = g_votes[i].empty;
+                best_idx = (int)i;
+            }
+        }
+        if (best_idx >= 0 && any_rejected && best_empty >= kMinProbesForConsensus / 2) {
+            return kScriptOffsetCandidates[best_idx];
+        }
+        // Exceeded probe budget without a winner — cap failure to avoid
+        // probing every UFunction forever.
+        if (g_probes_attempted >= kMinProbesForConsensus * 4) return -2;
+    }
+
+    return -1;
 }
 
 ScriptView get_function_script(uevr::API::UFunction* func)
@@ -149,13 +236,23 @@ ScriptView get_function_script(uevr::API::UFunction* func)
     if (!func) return out;
 
     int32_t cached = g_cache.script_offset.load(std::memory_order_acquire);
-    if (cached == -1) {
+    if (cached < 0) {
+        // -1 = undiscovered / deferred (keep trying on each call). -2 = permanent
+        // fail, don't retry. Middle path keeps the probe cheap per call while
+        // giving it many chances to land on a UFunction with a populated Script.
+        if (cached == -2) return out;
         std::lock_guard<std::mutex> lock(g_discovery_mutex);
         cached = g_cache.script_offset.load(std::memory_order_acquire);
-        if (cached == -1) {
-            cached = probe_script_offset(func);
-            g_cache.script_offset.store(cached, std::memory_order_release);
-            if (cached >= 0) g_cache.discoveries.fetch_add(1, std::memory_order_relaxed);
+        if (cached < 0) {
+            int32_t result = probe_script_offset(func);
+            // Only commit a permanent result (>=0 resolved, or -2 permanent fail).
+            // -1 (deferred on this function) stays unresolved so the next call
+            // tries again on a different function.
+            if (result >= 0 || result == -2) {
+                g_cache.script_offset.store(result, std::memory_order_release);
+                if (result >= 0) g_cache.discoveries.fetch_add(1, std::memory_order_relaxed);
+            }
+            cached = result;
         }
     }
     if (cached < 0) return out;
@@ -373,12 +470,24 @@ std::vector<std::string> disassemble(const ScriptView& script, size_t max_instru
 json diagnostics()
 {
     auto off = g_cache.script_offset.load();
+    json votes = json::array();
+    constexpr size_t N = sizeof(kScriptOffsetCandidates) / sizeof(kScriptOffsetCandidates[0]);
+    for (size_t i = 0; i < N; ++i) {
+        votes.push_back({
+            {"offset", kScriptOffsetCandidates[i]},
+            {"valid", g_votes[i].valid},
+            {"empty", g_votes[i].empty},
+            {"reject", g_votes[i].reject}
+        });
+    }
     return json{
-        {"field", "UFunction::Script"},
+        {"field", "UStruct::Script"},
         {"offset", off < 0 ? json(nullptr) : json(off)},
         {"status", off == -1 ? "undiscovered" : off == -2 ? "failed" : "resolved"},
         {"hits", g_cache.hits.load()},
-        {"discoveries", g_cache.discoveries.load()}
+        {"discoveries", g_cache.discoveries.load()},
+        {"probesAttempted", g_probes_attempted},
+        {"votes", votes}
     };
 }
 
@@ -388,6 +497,8 @@ void reset()
     g_cache.script_offset.store(-1);
     g_cache.hits.store(0);
     g_cache.discoveries.store(0);
+    for (auto& v : g_votes) v = CandidateVotes{};
+    g_probes_attempted = 0;
 }
 
 } // namespace KismetDisasm

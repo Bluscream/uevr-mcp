@@ -105,7 +105,7 @@ public static class PatternsleuthTools
     {
         var psExe = ResolvePatternsleuth();
         if (psExe is null)
-            return ExternalTools.Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return ExternalTools.Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
         if (!File.Exists(exePath))
             return ExternalTools.Err($"exe not found: {exePath}");
 
@@ -184,7 +184,7 @@ public static class PatternsleuthTools
     {
         var psExe = ResolvePatternsleuth();
         if (psExe is null)
-            return ExternalTools.Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return ExternalTools.Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
         if (!File.Exists(exePath))
             return ExternalTools.Err($"exe not found: {exePath}");
 
@@ -231,7 +231,7 @@ public static class PatternsleuthTools
     {
         var psExe = ResolvePatternsleuth();
         if (psExe is null)
-            return ExternalTools.Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return ExternalTools.Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
         if (!File.Exists(exePath))
             return ExternalTools.Err($"exe not found: {exePath}");
         if (baselineJsonPath is not null && !File.Exists(baselineJsonPath))
@@ -304,7 +304,7 @@ public static class PatternsleuthTools
     {
         var psExe = ResolvePatternsleuth();
         if (psExe is null)
-            return ExternalTools.Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return ExternalTools.Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
         if (!File.Exists(exePath))
             return ExternalTools.Err($"exe not found: {exePath}");
 
@@ -379,7 +379,7 @@ public static class PatternsleuthTools
     {
         var psExe = ResolvePatternsleuth();
         if (psExe is null)
-            return ExternalTools.Err("patternsleuth not found. Install from https://github.com/trumank/patternsleuth or set $PATTERNSLEUTH_EXE.");
+            return ExternalTools.Err("patternsleuth not found. Install with `cargo install --git https://github.com/trumank/patternsleuth patternsleuth_cli` (no crates.io / GitHub releases exist — master HEAD is the only source), or point $PATTERNSLEUTH_EXE at an existing binary.");
         if (!File.Exists(exePath))
             return ExternalTools.Err($"exe not found: {exePath}");
 
