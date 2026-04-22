@@ -278,6 +278,63 @@ public static class UhtSdkTools
     // a UHT-style C++ type string. Used for method parameter/return types
     // when we don't have a recursive tag (methods come from enumerate_methods
     // which flattens type info).
+    // Render a CDO default value as a C++ literal where it makes sense, otherwise
+    // return null (caller emits a /*default: …*/ comment instead).
+    //
+    // Matches UHT-style initializers: `= 0.5f`, `= 12`, `= true`, `= FName("X")`,
+    // `= TEXT("X")`. UE4.26–UE5 standards.
+    static string? RenderCppLiteral(JsonElement val, string cppType)
+    {
+        try
+        {
+            switch (val.ValueKind)
+            {
+                case JsonValueKind.True:  return "true";
+                case JsonValueKind.False: return "false";
+                case JsonValueKind.Number:
+                {
+                    // Choose literal suffix from the declared cpp type so round-trip
+                    // via cl.exe doesn't lose precision. For floats we ensure a
+                    // decimal point is present — "0f" isn't valid C++ float syntax,
+                    // needs "0.0f".
+                    static string Floaty(double d)
+                    {
+                        var s = d.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+                        if (!s.Contains('.') && !s.Contains('e') && !s.Contains('E')) s += ".0";
+                        return s;
+                    }
+                    if (cppType == "float")  return Floaty(val.GetDouble()) + "f";
+                    if (cppType == "double") return Floaty(val.GetDouble());
+                    if (cppType == "int32" || cppType == "int16" || cppType == "int8" || cppType == "int64")
+                        return val.GetInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    if (cppType == "uint8" || cppType == "uint16" || cppType == "uint32" || cppType == "uint64")
+                        return val.GetUInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    return val.GetRawText();
+                }
+                case JsonValueKind.String:
+                {
+                    var s = val.GetString() ?? "";
+                    if (cppType == "FName")   return $"FName(TEXT(\"{EscapeCppString(s)}\"))";
+                    if (cppType == "FString") return $"TEXT(\"{EscapeCppString(s)}\")";
+                    if (cppType == "FText")   return $"FText::FromString(TEXT(\"{EscapeCppString(s)}\"))";
+                    // Enum default comes as "EType::Member" or bare "Member" — both safe as identifiers.
+                    if (cppType.StartsWith("E") && cppType.Length > 1 && char.IsUpper(cppType[1]) && !s.Contains('"'))
+                        return s.Contains("::") ? s : $"{cppType}::{Sanitize(s)}";
+                    return null;  // unknown string-to-cpp mapping — comment fallback
+                }
+                default: return null;
+            }
+        }
+        catch { return null; }
+    }
+
+    static string EscapeCppString(string s) => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    static string CompactJson(JsonElement e)
+    {
+        var s = e.GetRawText();
+        return s.Length > 80 ? s.Substring(0, 77) + "..." : s;
+    }
+
     static string MapPropertyTypeToUht(string? raw) => raw switch
     {
         null            => "void",
@@ -497,8 +554,20 @@ public static class UhtSdkTools
                 var uhtType = hasTag ? RenderUhtType(tag) : "uint8";
                 var spec = UPropertySpecifier((CPF)flags);
 
+                // Phase 4C: CDO default-value initializer when it renders as a
+                // scalar C++ literal. Compound types (structs, arrays, objects)
+                // carry through as a comment so the human reader can see them
+                // but we don't try to synthesize a C++ initializer.
+                string initializer = "";
+                string defComment  = "";
+                if (f.TryGetProperty("defaultValue", out var dv))
+                {
+                    var lit = RenderCppLiteral(dv, uhtType);
+                    if (lit is not null) initializer = " = " + lit;
+                    else defComment = "  // default: " + CompactJson(dv);
+                }
                 body.AppendLine($"    {spec}");
-                body.AppendLine($"    {uhtType} {Sanitize(fname)};  // +0x{offset:X}");
+                body.AppendLine($"    {uhtType} {Sanitize(fname)}{initializer};  // +0x{offset:X}{defComment}");
                 body.AppendLine();
             }
         }

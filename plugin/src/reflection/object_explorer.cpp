@@ -1366,8 +1366,8 @@ static void dump_range(int begin, int end,
         }
 
         // Phase 4: UClass-only metadata — classFlags, classConfigName, classWithin,
-        // interfaces[]. ScriptStructs don't have any of these. Struct* can be cast
-        // blind because we classified this as `is_class` already.
+        // interfaces[], plus Phase 4C CDO default values. ScriptStructs don't have
+        // CDOs or class flags; only classes reach here.
         if (is_class) {
             try {
                 uint32_t cflags = PropertyProbes::get_class_flags(ustruct);
@@ -1391,6 +1391,7 @@ static void dump_range(int begin, int end,
                     if (!arr.empty()) t["interfaces"] = arr;
                 }
             } catch (...) { /* probes are best-effort */ }
+
         }
 
         // Emit "own" fields only (not walking supers) so USMAP schemas are correctly
@@ -1427,6 +1428,32 @@ static void dump_range(int begin, int end,
             }
         } catch (...) {
             t["fieldsError"] = "exception while walking child_properties chain";
+        }
+        // Phase 4C — CDO default values. Backfill after we've built own_fields so
+        // we can enrich each field entry in place. Only meaningful for classes;
+        // ScriptStructs don't have a CDO.
+        if (is_class) {
+            try {
+                auto cls = reinterpret_cast<API::UClass*>(ustruct);
+                API::UObject* cdo = cls->get_class_default_object();
+                if (cdo != nullptr && own_fields.is_array()) {
+                    for (size_t i = 0; i < own_fields.size(); ++i) {
+                        try {
+                            json& f = own_fields.at(i);
+                            if (!f.is_object() || !f.contains("name")) continue;
+                            std::string fname_utf8 = f.at("name").get<std::string>();
+                            std::wstring wname = JsonHelpers::utf8_to_wide(fname_utf8);
+                            std::wstring_view wv(wname);
+                            API::FProperty* fprop = ustruct->find_property(wv);
+                            if (fprop == nullptr) continue;
+                            json defval = PropertyReader::read_property(cdo, fprop, 0);
+                            if (!defval.is_null()) {
+                                f["defaultValue"] = defval;
+                            }
+                        } catch (...) { /* per-field best-effort */ }
+                    }
+                }
+            } catch (...) { /* CDO access best-effort */ }
         }
         t["fields"] = own_fields;
         if (field_errors > 0) t["fieldErrors"] = field_errors;

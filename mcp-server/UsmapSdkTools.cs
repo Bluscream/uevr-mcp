@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using ModelContextProtocol.Server;
 
 namespace UevrMcp;
@@ -88,7 +89,8 @@ public static class UsmapSdkTools
     // array. We pick Class vs Struct by name prefix ('A' or 'U' for classes,
     // 'F' for structs, plus a falls-back-to-struct rule).
 
-    static JsonDocument AdaptJmapToReflection(JsonElement jmapRoot)
+    static JsonDocument AdaptJmapToReflection(JsonElement jmapRoot,
+        Dictionary<string, Dictionary<string, int>>? offsetMap = null)
     {
         var classes = new List<object>();
         var structs = new List<object>();
@@ -133,10 +135,26 @@ public static class UsmapSdkTools
                         var innerRaw = fp.GetProperty("inner");
                         var tag = InnerToTag(innerRaw);
                         string typeName = tag.TryGetValue("type", out var t) && t is string ts ? ts : "Unknown";
+                        // Try to backfill offset from Dumper-7's text dump. Look up by
+                        // the class's own name or the "A"-prefixed variant (Dumper-7
+                        // uses C++ prefixes where jmap's USMAP uses stripped names).
+                        int offset = 0;
+                        if (offsetMap is not null)
+                        {
+                            foreach (var key in new[] { name, "A" + name, "U" + name, "F" + name, "E" + name })
+                            {
+                                if (offsetMap.TryGetValue(key, out var classOffsets)
+                                    && classOffsets.TryGetValue(fname, out var found))
+                                {
+                                    offset = found;
+                                    break;
+                                }
+                            }
+                        }
                         fields.Add(new {
                             name  = fname,
                             type  = typeName,
-                            offset = 0,               // USMAP doesn't carry memory offsets
+                            offset,
                             owner = name,
                             tag   = tag,
                         });
@@ -280,22 +298,31 @@ public static class UsmapSdkTools
     // ─── Tool: USMAP → UHT project ─────────────────────────────────────
 
     [McpServerTool(Name = "uevr_dump_uht_from_usmap")]
-    [Description("Convert any USMAP (Dumper-7, jmap, or our uevr_dump_usmap output) into a full UHT-style UE4/UE5 project scaffold. Shells to jmap's usmap CLI to parse, then runs the same UHT emitter + project generator used by uevr_dump_ue_project against live reflection. Use this when UEVR injection is unsafe (DX12 AAA games that crash UEVR's render hooks) and you've already dumped a USMAP via Dumper-7. Output matches uevr_dump_ue_project but without the UEVR-only fields (per-property offsets, UCLASS/UFUNCTION flags, interface lists, ClassConfigName) — USMAP doesn't carry those.")]
+    [Description("Convert any USMAP (Dumper-7, jmap, or our uevr_dump_usmap output) into a full UHT-style UE4/UE5 project scaffold. Shells to jmap's usmap CLI to parse, then runs the same UHT emitter + project generator used by uevr_dump_ue_project against live reflection. Use this when UEVR injection is unsafe and you've already dumped a USMAP via Dumper-7. Pass `gObjectsPath` pointing at Dumper-7's `GObjects-Dump-WithProperties.txt` to backfill real per-property offsets into the output (closes USMAP's biggest quality gap). Output matches uevr_dump_ue_project but without the UEVR-only fields (UCLASS/UFUNCTION flags, interface lists, ClassConfigName).")]
     public static string DumpUhtFromUsmap(
         [Description("Absolute path to the input .usmap file.")] string usmapPath,
         [Description("Absolute output directory for the generated project.")] string outDir,
         [Description("Project name for the .uproject / Target.cs. Defaults to the usmap file's base name.")] string? projectName = null,
         [Description("Module name to place all types in (USMAP doesn't carry package origin). Default 'SDK'.")] string moduleName = "SDK",
-        [Description("Engine association written into .uproject (default '4.26').")] string engineAssociation = "4.26")
+        [Description("Engine association written into .uproject (default '4.26').")] string engineAssociation = "4.26",
+        [Description("Optional path to Dumper-7's GObjects-Dump-WithProperties.txt — if provided, per-property offsets are backfilled from it (USMAP itself doesn't carry memory offsets). Big quality win for the fallback path.")] string? gObjectsPath = null)
     {
         if (!File.Exists(usmapPath))
             return JsonSerializer.Serialize(new { ok = false, error = $"usmap not found: {usmapPath}" }, JsonOpts);
+
+        // Optional offset map from Dumper-7's text dump.
+        Dictionary<string, Dictionary<string, int>>? offsetMap = null;
+        if (!string.IsNullOrEmpty(gObjectsPath) && File.Exists(gObjectsPath))
+        {
+            try { offsetMap = ParseDumper7Offsets(gObjectsPath); }
+            catch { /* best effort; absence is not fatal */ }
+        }
 
         JsonDocument reflection;
         try
         {
             using var jmapDoc = ParseUsmap(usmapPath);
-            reflection = AdaptJmapToReflection(jmapDoc.RootElement);
+            reflection = AdaptJmapToReflection(jmapDoc.RootElement, offsetMap);
         }
         catch (Exception ex)
         {
@@ -305,11 +332,62 @@ public static class UsmapSdkTools
         using (reflection)
         {
             projectName ??= Path.GetFileNameWithoutExtension(usmapPath);
-            // Drive the project scaffolder directly through the reflection-fetch
-            // seam. We stub FetchReflectionPublic-style input by handing the
-            // adapted doc to the UHT emitter via a shared internal path.
             return UhtSdkTools.EmitUhtProjectFromReflection(reflection.RootElement,
                 outDir, projectName, moduleName, engineAssociation);
         }
+    }
+
+    // ─── Dumper-7 offset parser ────────────────────────────────────────
+    //
+    // Dumper-7 writes GObjects-Dump-WithProperties.txt with tab-indented
+    // property lines directly under each class header:
+    //
+    //   [00000000] {0x1a168620} Package CoreUObject
+    //   [00000001] {0xace4300} Class CoreUObject.Object
+    //   [00000028] {0x73bf3260}	ClassProperty NativeClass
+    //
+    // The [offset] bracket is the memory offset of that property inside its
+    // containing UStruct. Parse into a className → {propName → offset} map
+    // so the adapter can inject real offsets into the USMAP-derived fields.
+
+    static readonly Regex ReClassHeader = new(
+        @"^\[[\da-fA-F]+\]\s*\{0x[\da-fA-F]+\}\s*(?:Class|ScriptStruct)\s+[\w/]+\.(\w+)",
+        RegexOptions.Compiled);
+    static readonly Regex RePropertyLine = new(
+        @"^\s*\[([\da-fA-F]+)\]\s*\{0x[\da-fA-F]+\}\s*\w+Property\s+(\w+)",
+        RegexOptions.Compiled);
+
+    static Dictionary<string, Dictionary<string, int>> ParseDumper7Offsets(string path)
+    {
+        var map = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        string? currentClass = null;
+        foreach (var line in File.ReadLines(path))
+        {
+            if (line.Length == 0 || line[0] != '[' && line[0] != ' ' && line[0] != '\t') continue;
+
+            // Class/struct header at column 0.
+            if (line.Length > 0 && line[0] == '[')
+            {
+                var hm = ReClassHeader.Match(line);
+                if (hm.Success)
+                {
+                    currentClass = hm.Groups[1].Value;
+                    continue;
+                }
+                // Fall through — could be package/enum line we don't care about.
+            }
+
+            // Tab-indented property line.
+            if (currentClass is null) continue;
+            var pm = RePropertyLine.Match(line);
+            if (!pm.Success) continue;
+            if (!int.TryParse(pm.Groups[1].Value, System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out int offset))
+                continue;
+            if (!map.TryGetValue(currentClass, out var fields))
+                map[currentClass] = fields = new Dictionary<string, int>(StringComparer.Ordinal);
+            fields[pm.Groups[2].Value] = offset;
+        }
+        return map;
     }
 }
