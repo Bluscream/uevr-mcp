@@ -81,6 +81,53 @@ static bool seh_read_ptr(const void* src, void** dst) noexcept
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ── FVector/FMatrix value-space anchor (UEVR technique) ──────────
+//
+// Adapted from UEVR's UScriptStruct::update_offsets() in
+// UESDK/src/sdk/UClass.cpp. FVector always has PropertiesSize == 12
+// (UE4 float) or 24 (UE5 LargeWorldCoordinatesReal double). FMatrix4
+// always has 64 (UE4) or 128 (UE5). The pair uniquely identifies the
+// PropertiesSize offset in UStruct with no shape ambiguity — no other
+// offset in UStruct's layout reads as (matrix=64, vector=12) because
+// MinAlignment, Children pointer low-bits, etc. won't co-match those
+// specific values.
+//
+// Once PropertiesSize is known, Script is at PropertiesSize_offset + 8
+// (PropertiesSize int32 + MinAlignment int32 = 8 bytes before Script).
+//
+// Returns -1 on failure (FVector/FMatrix classes not found in this game),
+// else the discovered Script offset.
+static int32_t discover_script_via_vector_anchor() noexcept
+{
+    auto& api = uevr::API::get();
+    if (!api) return -1;
+
+    auto fvector = api->find_uobject<uevr::API::UStruct>(L"ScriptStruct /Script/CoreUObject.Vector");
+    auto fmatrix = api->find_uobject<uevr::API::UStruct>(L"ScriptStruct /Script/CoreUObject.Matrix");
+    if (!fvector || !fmatrix) return -1;
+
+    // PropertiesSize is an int32 member. UEVR scans from SuperStruct+ptr
+    // through 0x300. We scan a tighter range since we know UStruct base
+    // size ~0x40 and PropertiesSize lives before Script.
+    for (int32_t off = 0x40; off < 0x100; off += 4) {
+        int32_t vec_size = 0, mat_size = 0;
+        __try {
+            vec_size = *(int32_t*)((uint8_t*)fvector + off);
+            mat_size = *(int32_t*)((uint8_t*)fmatrix + off);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+        // UE4 float precision (RoboQuest 4.26): FVector=12, FMatrix=64
+        // UE5 double precision (LWC): FVector=24, FMatrix=128
+        bool ue4_match = (vec_size == 12 && mat_size == 64);
+        bool ue5_match = (vec_size == 24 && mat_size == 128);
+        if (!ue4_match && !ue5_match) continue;
+
+        // PropertiesSize at `off`, MinAlignment at `off+4`, Script at `off+8`.
+        return off + 8;
+    }
+    return -1;
+}
+
 // ── Probe UStruct::Script offset ──────────────────────────────────
 //
 // Script is a UStruct member (NOT a UFunction-specific one): confirmed in
@@ -237,22 +284,30 @@ ScriptView get_function_script(uevr::API::UFunction* func)
 
     int32_t cached = g_cache.script_offset.load(std::memory_order_acquire);
     if (cached < 0) {
-        // -1 = undiscovered / deferred (keep trying on each call). -2 = permanent
-        // fail, don't retry. Middle path keeps the probe cheap per call while
-        // giving it many chances to land on a UFunction with a populated Script.
         if (cached == -2) return out;
         std::lock_guard<std::mutex> lock(g_discovery_mutex);
         cached = g_cache.script_offset.load(std::memory_order_acquire);
         if (cached < 0) {
-            int32_t result = probe_script_offset(func);
-            // Only commit a permanent result (>=0 resolved, or -2 permanent fail).
-            // -1 (deferred on this function) stays unresolved so the next call
-            // tries again on a different function.
-            if (result >= 0 || result == -2) {
+            // Primary path: value-space anchor via FVector/FMatrix PropertiesSize.
+            // Adapted from UEVR's UScriptStruct::update_offsets(). This is a
+            // one-shot discovery — no multi-call consensus needed because the
+            // anchor is mathematically unique.
+            int32_t result = discover_script_via_vector_anchor();
+            if (result >= 0) {
                 g_cache.script_offset.store(result, std::memory_order_release);
-                if (result >= 0) g_cache.discoveries.fetch_add(1, std::memory_order_relaxed);
+                g_cache.discoveries.fetch_add(1, std::memory_order_relaxed);
+                cached = result;
+            } else {
+                // Fallback: consensus probe. For games where FVector/FMatrix
+                // classes can't be resolved (custom cooks, unusual builds),
+                // fall back to the multi-function shape-based consensus.
+                result = probe_script_offset(func);
+                if (result >= 0 || result == -2) {
+                    g_cache.script_offset.store(result, std::memory_order_release);
+                    if (result >= 0) g_cache.discoveries.fetch_add(1, std::memory_order_relaxed);
+                }
+                cached = result;
             }
-            cached = result;
         }
     }
     if (cached < 0) return out;

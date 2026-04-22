@@ -97,9 +97,16 @@ static void* read_ptr_at(void* base, int32_t offset) noexcept
 
 // Validate: pointer looks like a UClass / UScriptStruct / UEnum (anything
 // reachable via UObjectHook::exists). Callers narrow further when needed.
+//
+// The low-bit check matches UEVR's update_offsets() hardening pattern —
+// UE5 TObjectPtr encodings tag pointers with the low bit set to mark
+// unresolved / compressed references. A tagged pointer should never be
+// dereferenced directly. See UESDK/src/sdk/UObjectBase.cpp for the
+// canonical `(ptr & 1) != 0` rejection.
 static bool is_plausible_uobject(void* p) noexcept
 {
     if (!p || !page_readable(p, 8)) return false;
+    if ((reinterpret_cast<uintptr_t>(p) & 1) != 0) return false;
     try {
         return uevr::API::UObjectHook::exists(reinterpret_cast<uevr::API::UObject*>(p));
     } catch (...) { return false; }
@@ -136,9 +143,12 @@ static bool seh_try_get_field_class(void* p, uevr::API::FFieldClass** out_fc) no
 static bool is_plausible_fproperty(void* p) noexcept
 {
     if (!p || !page_readable(p, 0x20)) return false;
+    // Reject UE5 TObjectPtr tag pattern.
+    if ((reinterpret_cast<uintptr_t>(p) & 1) != 0) return false;
     uevr::API::FFieldClass* fc = nullptr;
     if (!seh_try_get_field_class(p, &fc)) return false;
     if (!fc || !page_readable(fc, 0x20)) return false;
+    if ((reinterpret_cast<uintptr_t>(fc) & 1) != 0) return false;
     // Resolve the class's FName in a C++ frame; wrapped in try/catch in case
     // UEVR's FName lookup throws on a bogus pointer.
     try {
