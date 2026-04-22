@@ -86,18 +86,41 @@ public static class SetupTools
 
     static Process? FindRunningByExe(string exePath)
     {
-        var name = Path.GetFileNameWithoutExtension(exePath);
-        foreach (var p in Process.GetProcessesByName(name))
+        Process[] candidates;
+        try
+        {
+            var name = Path.GetFileNameWithoutExtension(exePath);
+            candidates = Process.GetProcessesByName(name);
+        }
+        catch { return null; }
+
+        if (candidates.Length == 0) return null;
+
+        // Prefer the process whose MainModule.FileName exactly matches the exe
+        // path we were handed. On Steam games with a launcher-stub + inner
+        // game-exe pattern (both using the same image name), this disambiguates.
+        foreach (var p in candidates)
         {
             try
             {
-                if (string.Equals(p.MainModule?.FileName, exePath, StringComparison.OrdinalIgnoreCase))
+                var mm = p.MainModule;
+                if (mm != null && string.Equals(mm.FileName, exePath, StringComparison.OrdinalIgnoreCase))
                     return p;
             }
-            catch { /* access denied on some processes — fall through */ }
-            return p; // first by-name match is good enough
+            catch { /* access denied — try the next one */ }
         }
-        return null;
+        // Secondary: the process with a real main window (not the stub launcher).
+        foreach (var p in candidates)
+        {
+            try
+            {
+                if (p.MainWindowHandle != IntPtr.Zero)
+                    return p;
+            }
+            catch { }
+        }
+        // Last resort: first by name.
+        return candidates[0];
     }
 
     static Process LaunchGame(string exePath, string? args)
@@ -173,6 +196,14 @@ public static class SetupTools
         [Description("How long to wait (ms) for a main window before injecting. Default 20000.")] int windowWaitMs = 20000,
         [Description("Skip the plugin copy step (useful if already installed). Default false.")] bool skipPluginInstall = false,
         [Description("Skip backend injection (only install the plugin). Default false.")] bool skipInject = false)
+    {
+        try { return await SetupGameImpl(gameExe, launchIfMissing, launchArgs, backendDll, pluginDll, windowWaitMs, skipPluginInstall, skipInject); }
+        catch (Exception ex) { return Err("uevr_setup_game threw: " + ex.ToString()); }
+    }
+
+    static async Task<string> SetupGameImpl(
+        string gameExe, bool launchIfMissing, string? launchArgs, string? backendDll,
+        string? pluginDll, int windowWaitMs, bool skipPluginInstall, bool skipInject)
     {
         if (!OperatingSystem.IsWindows())
             return Err("uevr_setup_game is Windows-only.");
