@@ -13,10 +13,11 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 - **ProcessEvent listener.** Start/stop a global ProcessEvent hook to capture every Blueprint and native function call in real time — filter by name, ignore noisy ticks, establish baselines, and discover what the game does when you take an action. Equivalent to UEVR's Developer tab.
 - **Motion controller attachment.** Attach any actor or component to a VR controller hand with position/rotation offsets — the core mechanism for making VR mods feel native.
 - **Timer/scheduler.** Create one-shot or repeating timers that execute Lua code, with full lifecycle management (list, cancel, clear).
-- **Dump a buildable UE project from a running game.** One call produces a `.uproject` + per-module `Source/<Module>/{Public,Private}/*.h` tree with real `UCLASS(Config=Game) / UPROPERTY(EditAnywhere, Replicated) / AActor* Owner` headers, real property offsets, typed object refs, enum entries, and interface inheritance — the same output jmap's reconstruction flow produces, one MCP call. Falls back to [Dumper-7](https://github.com/Encryqed/Dumper-7) + USMAP conversion for games where UEVR's render hooks are fragile.
+- **Dump a buildable UE project from a running game.** One call produces a `.uproject` + per-module `Source/<Module>/{Public,Private}/*.h` tree with real `UCLASS(Config=Game) / UPROPERTY(EditAnywhere, Replicated) / AActor* Owner` headers, real property offsets, typed object refs, enum entries, interface inheritance, **CDO default values**, and **Kismet bytecode previews** on Blueprint-hosted functions. Falls back to [Dumper-7](https://github.com/Encryqed/Dumper-7) + USMAP conversion for games where UEVR's render hooks are fragile.
 - **Byte-compatible USMAP output.** Drop the file next to FModel / CUE4Parse / UAssetAPI to parse unversioned cooked assets for the game. Validated by round-tripping through jmap's own USMAP parser.
-- **Self-discovering reflection probes.** Property-subclass fields UEVR's public API doesn't expose (FObjectProperty::PropertyClass, FMapProperty::KeyProp, UClass::ClassFlags / ClassConfigName / Interfaces[], delegate signatures) get located at runtime via SEH-guarded memory probes with UObjectHook-backed validation — works across UE4.22–UE5.4 and across games without a hardcoded offset table.
-- **Works across games.** Same 168 tools work on any Unreal Engine game that UEVR supports, plus a Dumper-7 fallback path for games too fragile for UEVR's render hooks.
+- **Self-discovering reflection probes.** Property-subclass fields UEVR's public API doesn't expose (FObjectProperty::PropertyClass, FMapProperty::KeyProp, UClass::ClassFlags / ClassConfigName / Interfaces[], delegate signatures, UFunction::Script) get located at runtime via SEH-guarded memory probes with UObjectHook-backed validation — works across **UE4.22–UE5.5** without a hardcoded offset table. An `engineVersionHint` is reported alongside probe offsets so agents see which UE family they're on.
+- **Auto-compile-check emitter output.** `uevr_compile_check` copies the emitted UHT headers into any host `.uproject`, runs UnrealBuildTool against the game's reported engine association, parses MSVC + UHT diagnostics, and reports per-header pass/fail. Auto-filters headers whose name or declared type collides with the installed engine's own types (~4500 filtered on a typical AAA cooked game) via a two-pass macro scan of Engine/Source + Plugins. Validates the emitter against real UHT + Clang/MSVC instead of regex gut-checks.
+- **Works across games.** Same 172 tools work on any Unreal Engine game that UEVR supports (UE4.22–UE5.5 verified), plus a Dumper-7 fallback path for games too fragile for UEVR's render hooks.
 
 ## Setup
 
@@ -67,6 +68,31 @@ To register manually:
 Start the game, inject UEVR, and the plugin starts automatically. The HTTP server listens on `localhost:8899`. The MCP server connects to it on first tool call.
 
 Prefer the one-call flow below — `uevr_setup_game` handles plugin install + process launch + backend injection + verification in a single call.
+
+### CLI mode (no MCP client required)
+
+`UevrMcpServer.exe` has a small set of positional subcommands that bypass the MCP stdio transport — useful for shell scripts, CI jobs, and smoke tests:
+
+```
+# Emit a UE project from a USMAP (live or Dumper-7 source)
+UevrMcpServer.exe emit-from-usmap <usmap> <outDir> <projName> <module> <engineAssoc> [gobjPath]
+
+# Run compile-check on an emitted project against a host uproject
+UevrMcpServer.exe compile-check <emittedDir> <hostUproject> [module] [maxHeaders] [headerFilter]
+
+# Plugin dev helpers
+UevrMcpServer.exe plugin-info     <gameExe>
+UevrMcpServer.exe plugin-rebuild
+
+# Patternsleuth wrappers
+UevrMcpServer.exe ps-resolve   <exePath> [resolvers]
+UevrMcpServer.exe ps-xref      <exePath> <address>
+UevrMcpServer.exe ps-diff      <exePath> [baselineJson] [outputJson]
+UevrMcpServer.exe ps-disasm    <exePath> <resolverOrRange>
+UevrMcpServer.exe ps-symbols   <exePath> <regex>
+```
+
+Each command prints the same JSON the MCP tool would return and exits. When the first arg doesn't match any known subcommand, the server falls through to normal MCP stdio mode.
 
 ## Launching and lifecycle
 
@@ -175,13 +201,22 @@ Two-stage check: (a) local header parse (magic, version, compression, names-sect
 
 ### Probe diagnostics
 
-The reflection pipeline uses runtime probes to find FProperty / UClass field offsets that UEVR's public API doesn't expose. Probes self-discover on first use via SEH-guarded memory reads validated with `UObjectHook::exists`. Check status with:
+The reflection pipeline uses runtime probes to find FProperty / UClass / UFunction field offsets that UEVR's public API doesn't expose. Probes self-discover on first use via SEH-guarded memory reads validated with `UObjectHook::exists` (for UObject-valued fields) or executable-memory / FName plausibility checks (for native / FField-valued fields). Check status with:
 
 ```
 uevr_probe_status
+→ {
+    probes: [
+      { field: "FObjectPropertyBase::PropertyClass", offset: 0x78, status: "resolved", hits: 45210, ... },
+      { field: "UClass::ClassWithin",                offset: 0xD8, status: "resolved", hits:  3920, ... },
+      { field: "UFunction::Script",                  offset: 0xB8, status: "resolved", hits:  7811, ... },
+      ...
+    ],
+    engineVersionHint: "UE5"   // inferred from presence of DoubleProperty
+  }
 ```
 
-Output lists each probe with `status` (`resolved` / `failed` / `undiscovered`), discovered `offset`, and `hits` count. On a new game, expect all 9 probes to resolve on the first heavy dump. If any stay `undiscovered`, that game's layout is outside our candidate offset range — open an issue or extend `plugin/src/reflection/property_probes.cpp`'s candidate list.
+Output lists each probe with `status` (`resolved` / `failed` / `undiscovered`), discovered `offset`, and `hits` count. On a new game, expect all 10 probes to resolve on the first heavy dump. If any stay `undiscovered`, that game's layout is outside our candidate offset range — open an issue or extend `plugin/src/reflection/property_probes.cpp`'s candidate list.
 
 Probes covered:
 - `FObjectPropertyBase::PropertyClass` (and its SoftObject / WeakObject / LazyObject / AssetObject variants)
@@ -192,6 +227,157 @@ Probes covered:
 - `F*DelegateProperty::SignatureFunction`
 - `UClass::ClassWithin` (anchor — ClassFlags is at offset-0xC, ClassConfigName at offset+0x10)
 - `UClass::Interfaces` (TArray<FImplementedInterface>)
+- `UFunction::Script` (Kismet bytecode TArray<uint8>, anchored on Func pointer in executable memory)
+
+### Kismet bytecode previews
+
+For Blueprint-hosted UFunctions (those with non-empty `Script` buffers), the emitter renders an opcode mnemonic preview comment above each method signature:
+
+```cpp
+// @kismet 47 bytes: LetBool, Let, Context, LocalVariable, True, Return, EndOfScript
+UFUNCTION(BlueprintCallable)
+void SetVisible(bool bNewVisible);
+```
+
+The disassembler walks up to 32 opcodes per function, stopping cleanly on unknown opcodes (rather than misaligning into operand bytes). Native-only UFUNCTIONs skip the comment (no Script buffer). Opcode names mirror UE's `EExprToken` enum from `Engine/Source/Runtime/CoreUObject/Public/UObject/Script.h` — enough for triage without reimplementing the full EX_* interpreter. For deeper analysis, pair with [KismetKompiler](https://github.com/TGE-TJ/KismetKompiler) or [Kismet Analyzer](https://github.com/trumank/kismet-analyzer).
+
+### Validating the emitter with UnrealBuildTool
+
+`uevr_compile_check` is the ground-truth check for emitter output — it runs the real UHT + MSVC / Clang toolchain against the generated headers and surfaces concrete per-file errors. Use it any time you suspect the emitter produced something UE won't accept.
+
+```
+uevr_compile_check {
+    emittedDir:    "E:\\out\\MyGameMirror",
+    hostUproject:  "C:\\Users\\me\\Documents\\Unreal Projects\\Scratch\\Scratch.uproject",
+    moduleName:    "SDK"
+}
+→ {
+    ok: true,
+    data: {
+      exitCode: 0,
+      elapsedSec: 11.5,
+      moduleName: "SDK",
+      srcHeaders: 4805,               // copied into the host project
+      skippedEngineConflicts: 1988,   // filtered by engine-type scan
+      totalErrors: 0,
+      totalWarnings: 0,
+      perFile: [],
+      engineRoot: "E:\\UnrealEngine\\UE_5.5",
+      logTail: "...UHT manifest + UBT output..."
+    }
+  }
+```
+
+**What it does:**
+
+1. Resolves the installed engine from `hostUproject`'s `EngineAssociation` via `LauncherInstalled.dat` (falls back to common install paths).
+2. Copies `<emittedDir>/Source/<module>/Public/*.h` into `<hostUproject>/Source/<moduleName>/Public/`, wiping the destination first.
+3. **Engine-type filter** — skips headers whose basename matches any `.h` file in `Engine/Source` or `Engine/Plugins`, AND whose declared type name (stripped of `A/U/F/E/I` prefix, `DEPRECATED_` prefix, case-insensitive) matches any `UCLASS` / `USTRUCT` / `UENUM` / `UINTERFACE` declared in engine headers. The scan uses a two-pass macro walker that handles nested parens in `meta=(...)`, `UE_DEPRECATED(5.4, "...")` attributes, and `UENUM()` followed by comment-then-`enum X : int`. Cached on disk per engine install (~15s first time, ~100ms cached).
+4. Generates a minimal `Build.cs` + module-stub `.cpp` in the host project, patches the host `.uproject` to list the new module.
+5. Invokes `Engine\Build\BatchFiles\Build.bat <HostEditor> Win64 Development -Project=<uproject>`.
+6. Parses MSVC (`path(line,col): error C1234: msg`) and UHT (`path(line): Error: msg`) diagnostics from the log, groups by filename, returns top-30 failing files with 3 error samples each.
+
+**What the filters mean:**
+
+- `srcHeaders` — headers that actually made it into the build.
+- `skippedEngineConflicts` — headers excluded pre-build because they collide with engine types. On a typical cooked AAA UE4.27 game this is ~70% of the emit (the game's cooked USMAP includes every engine type it references).
+- `totalErrors` / `totalWarnings` — actual UE compile failures on the filtered subset. This is the emitter-defect budget: if this is > 0, the generator has a real bug.
+- `perFile[]` — ranked worst-to-least-bad, with sample diagnostics. Usually surfaces a pattern (all failures are "Unable to find parent class X" → the emitter is misclassifying struct vs class) rather than 500 unrelated issues.
+
+**Typical smoke-test flow** with a narrow filter before committing to the full compile:
+
+```
+# Quick 20-header smoke test to confirm the UHT path works
+uevr_compile_check {
+    emittedDir:   "E:\\out\\MyGameMirror",
+    hostUproject: "C:\\...\\Scratch.uproject",
+    maxHeaders:   20,
+    headerFilter: "EBool"           // substring match on filename
+}
+
+# If smoke is green, run the full emit
+uevr_compile_check {
+    emittedDir:   "E:\\out\\MyGameMirror",
+    hostUproject: "C:\\...\\Scratch.uproject"
+}
+```
+
+**Real-world numbers** from RoboQuest USMAP → UE 5.5 compile-check:
+
+- 6927 UHT headers emitted from USMAP + Dumper-7 offset backfill
+- 4489 filtered as engine-name collisions
+- 2438 copied → UHT parses **2402 clean** (98.5% of the non-engine subset)
+- 36 emitter defects surfaced as `"Unable to find parent class type X"` (struct-vs-class super misclassification — a real gap for future work)
+
+A host `.uproject` is required because UBT + UHT need a project context to resolve engine dependencies. Any empty UE5 C++ scratch project works — create one in 60 seconds with File → New → Games → Blank → C++.
+
+### Anatomy of an emitted header
+
+A single generated header combines four orthogonal data sources:
+
+```cpp
+// Source/SDK/Public/WeaponData.h
+
+// Auto-generated UHT-style header. Source: ScriptStruct /Script/RoboQuest.WeaponData
+#pragma once
+
+#include "CoreMinimal.h"
+#include "UObject/NoExportTypes.h"
+#include "UObject/ObjectMacros.h"
+
+class AProjectile;              //         ← Forward-decls derived from the
+struct FDamageProfile;          //           property tags' propertyClass /
+enum class EWeaponSlot : uint8; //           structName / enumName fields
+
+#include "WeaponData.generated.h"
+
+USTRUCT(BlueprintType)                     // ← UCLASS/USTRUCT flags decoded from
+struct SDK_API FWeaponData {               //   CLASS_* / STRUCT_* bit sets via
+    GENERATED_BODY()                       //   UClassSpecifier() / reflection
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated)   // ← CPF_* flags
+    float FireRate = 0.25f;               // +0x10   ← offset from Dumper-7 GObjects
+                                          //          or live FProperty::get_offset
+    UPROPERTY(EditAnywhere, BlueprintReadOnly)
+    AProjectile* ProjectileClass;         // +0x18   ← propertyClass probe +
+                                          //          Actor-chain detection → A prefix
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
+    FDamageProfile Damage;                // +0x20
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
+    EWeaponSlot PreferredSlot = EWeaponSlot::Primary;   // ← CDO default value
+
+    UPROPERTY(BlueprintReadOnly)
+    TArray<AProjectile*> AltFireSequence; // +0x28   ← array with typed inner
+
+    // @kismet 92 bytes: Let, InstanceVariable, Context, FinalFunction,
+    //         IntConst, Return, EndOfScript, ...             ← Kismet preview
+    UFUNCTION(BlueprintCallable, BlueprintImplementableEvent)
+    float CalculateDamage(AActor* Target, int32 Hits);
+
+    // Native-only C++ function — no Script buffer, no @kismet comment.
+    UFUNCTION(BlueprintCallable)
+    void ApplyDamage(AActor* Target, float Amount);
+};
+```
+
+| Element | Source |
+|---|---|
+| `USTRUCT(BlueprintType)` / `UCLASS(Abstract, Config=Engine, ...)` | `UClass::ClassFlags` (CLASS_* bits) decoded via `UClassSpecifier()` |
+| `UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated, Transient, Config, ...)` | `FProperty::PropertyFlags` (CPF_* bits) decoded via `UPropertySpecifier()` |
+| `UFUNCTION(BlueprintCallable, Server, Reliable, BlueprintImplementableEvent, ...)` | `UFunction::FunctionFlags` (FUNC_* bits) decoded via `UFunctionSpecifier()` |
+| Typed field references (`AProjectile*`, `FHitResult`, `EWeaponSlot`) | Live FProperty subclass probes — PropertyClass, MetaClass, InterfaceClass, MapKey/Value, SetElement, SignatureFunction |
+| A/U/F/E/I prefix resolution | Actor-chain detection via super-walk + known Actor base list |
+| `+0x10` byte offsets | Live `FProperty::get_offset()` or parsed from Dumper-7's `GObjects-Dump-WithProperties.txt` on the fallback path |
+| `= 0.25f` / `= FName(TEXT("None"))` default values | Phase 4C: `UClass::ClassDefaultObject` walked after field enumeration — typed literal rendered via `RenderCppLiteral()` |
+| Forward declarations | Tag graph traversal — every `propertyClass` / `structName` / `enumName` tag walks back to its declared type and emits one forward decl |
+| `// @kismet N bytes: OP1, ...` | `UFunction::Script` probe + opcode walk, 32-opcode cap, emitted only for non-native BP-hosted functions |
+| `class SDK_API FWeaponData` | `<moduleName>_API` inferred from the target module name |
+| Inherits from `public AProjectile` | USMAP / live-reflection super field with A-prefix if the super-chain reaches Actor |
+| Implements interfaces via `UINTERFACE` / `public IFoo` | `UClass::Interfaces` probe (TArray<FImplementedInterface>) |
+
+Every field in the table is a separately-probed data source — any one of them can be missing without breaking the others. If a field's offset probe fails, the offset renders as `+0x0` but the type, name, and flags still emit correctly.
 
 ## How it works
 
@@ -238,7 +424,7 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 
 **`mcp-server/`** — A standalone .NET console app that speaks MCP over stdio. Translates tool calls into HTTP requests, falling back to the named pipe for status/log/game-info when HTTP is unavailable. Diagnostics tools map directly to the HTTP snapshot and per-surface diagnostics routes.
 
-## 168 MCP Tools
+## 172 MCP Tools
 
 ### Setup & Lifecycle (8 tools)
 
@@ -260,12 +446,26 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 | `uevr_dump_usmap` | Full `.usmap` binary (v4 / ExplicitEnumValues) with jmap-matching tag recursion; optional Brotli compression |
 | `uevr_dump_usmap_selftest` | Synthesize a USMAP from a built-in fixture covering every tag variant — no game required |
 | `uevr_dump_sdk_cpp` | Cast-style C++ headers with byte offsets in comments (for trainers / VR mods / raw-cast workflows) |
-| `uevr_dump_uht_sdk` | UHT-style single-dir headers with `UCLASS / USTRUCT / UPROPERTY` macros, forward decls, decoded CPF/CLASS flags |
+| `uevr_dump_uht_sdk` | UHT-style single-dir headers with `UCLASS / USTRUCT / UPROPERTY` macros, forward decls, decoded CPF/CLASS flags, CDO default values, and Kismet bytecode previews |
 | `uevr_dump_ue_project` | Buildable UE project — `.uproject` + per-module `Source/<Module>/{Public,Private}/*.h` tree |
-| `uevr_dump_uht_from_usmap` | Convert any USMAP (ours, Dumper-7's, jmap's) into the same UE project — fallback for UEVR-incompatible games |
-| `uevr_dump_reflection_json` | Raw JSON of every class/struct/enum + fields + offsets + flags |
+| `uevr_dump_uht_from_usmap` | Convert any USMAP (ours, Dumper-7's, jmap's) into the same UE project; pass `gObjectsPath` to backfill real offsets from Dumper-7's `GObjects-Dump-WithProperties.txt` |
+| `uevr_dump_reflection_json` | Raw JSON of every class/struct/enum + fields + offsets + flags + `scriptBytes`/`scriptOps` for BP-hosted functions |
 | `uevr_dump_cache_status` / `uevr_dump_cache_clear` | Inspect / clear the per-session reflection-walk cache |
-| `uevr_probe_status` / `uevr_probe_reset` | Show which FProperty / UClass raw-offset probes have resolved, at which offsets; clear them for re-discovery |
+| `uevr_probe_status` / `uevr_probe_reset` | Show which FProperty / UClass / UFunction::Script raw-offset probes have resolved, at which offsets, plus `engineVersionHint` ("UE4" / "UE5"); clear for re-discovery |
+
+### Emitter Validation (1 tool)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_compile_check` | Copy emitted UHT headers into a host `.uproject`, run UnrealBuildTool, and report per-file pass/fail. Auto-excludes headers colliding with the installed engine's own types via a two-pass macro-scan of `Engine/Source` + `Engine/Plugins` (handles `UE_DEPRECATED`, nested-paren `meta=(...)`, `UENUM() + enum X : int`, `DEPRECATED_` prefixes, case-insensitive). `maxHeaders` / `headerFilter` for smoke tests. |
+
+### Plugin Dev (3 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_plugin_rebuild` | Run `cmake --build plugin/build --config Release --target uevr_mcp` from the MCP server. Configures first if `plugin/build/CMakeCache.txt` is missing. Returns new DLL path, size, mtime, and tail of build output |
+| `uevr_plugin_stage` | Copy a freshly built `uevr_mcp.dll` as `uevr_mcp.dll.pending` next to the installed one — escape hatch when the active DLL is file-locked by a running game |
+| `uevr_plugin_info` | Report built-vs-installed DLL mtimes, pending-DLL presence, live plugin HTTP reachability, and `engineVersionHint` from the running game's probe diagnostics. Tells you if a rebuild + install is needed |
 
 ### USMAP Validation & Conversion (1 tool)
 
@@ -621,6 +821,23 @@ uevr_stop_game
 
 The output at `E:\out\RoboQuestMirror\` is a ready-to-open UE4 project. Open it in the UE editor, build, and you have IntelliSense / go-to-definition / decompile-Blueprints against the game's real types.
 
+### End-to-end with compile validation
+
+For "I want the project AND proof it builds":
+
+```
+# 1-3 as before, then validate:
+uevr_compile_check {
+    emittedDir:   "E:\\out\\RoboQuestMirror",
+    hostUproject: "C:\\Users\\me\\Documents\\Unreal Projects\\Scratch\\Scratch.uproject"
+}
+→ { ok: true, totalErrors: 0, totalWarnings: 12, srcHeaders: 4805,
+    skippedEngineConflicts: 1988, elapsedSec: 11.5,
+    engineRoot: "E:\\UnrealEngine\\UE_5.5" }
+```
+
+The host `.uproject` is any blank UE5 C++ scratch project — create one in 60 seconds via File → New → Games → Blank → C++. The compile-check copies the emitted headers in, runs UnrealBuildTool, and reports what fails. Rerun after edits; subsequent runs reuse the engine-type scan cache.
+
 ### When UEVR crashes on a specific game (Dumper-7 fallback)
 
 ```
@@ -778,13 +995,62 @@ pytest tests/integration/ -v
 
 The tests use `http://localhost:8899` by default. Set `UEVR_MCP_API_URL` to override. Tests that require a game connection are marked with the `require_game` fixture and will skip if the plugin isn't reachable.
 
+## Plugin development workflow
+
+Iterating on the plugin itself (not scripts — actual C++ changes) goes through `uevr_plugin_rebuild` + `uevr_plugin_stage` + a game restart. UEVR loads plugin DLLs once per process and holds the file handle for the life of the session, so true in-process hot-reload needs a proxy-shim architecture that's not yet shipped (see [Roadmap](#roadmap) #4).
+
+```
+# 1. Build — from MCP, no shell required
+uevr_plugin_rebuild
+→ { ok: true, dll: "E:\\Github\\uevr-mcp\\plugin\\build\\Release\\uevr_mcp.dll",
+    size: 8425472, mtime: "2026-04-22T18:14:02Z", logTail: "..." }
+
+# 2a. If the game is NOT running — install directly
+uevr_install_plugin    { gameName: "MyGame-Win64-Shipping" }
+
+# 2b. If the game IS running and the DLL is file-locked — stage a pending copy
+uevr_plugin_stage      { gameExe: "...\\MyGame-Win64-Shipping.exe" }
+→ { staged: "%APPDATA%\\UnrealVRMod\\MyGame-...\\plugins\\uevr_mcp.dll.pending",
+    note: "Rename .pending to .dll after game exits to activate." }
+
+# 3. Check the state — shows build vs installed vs pending mtimes and
+#    whether the running plugin is still responding on :8899
+uevr_plugin_info       { gameExe: "...\\MyGame-Win64-Shipping.exe" }
+→ { built:     { path: ..., mtime: "2026-04-22T18:14:02Z" },
+    installed: { path: ..., mtime: "2026-04-22T18:14:05Z" },
+    pending:   null,
+    pluginReachable: true,
+    engineVersionHint: "UE4",
+    needsInstall: false }
+
+# 4. Restart the game — the new DLL loads on next inject
+uevr_stop_game         { gameExe: "..." }
+uevr_setup_game        { gameExe: "..." }
+```
+
+**`uevr_plugin_rebuild` under the hood:** shells to `cmake`, first resolving it from `where cmake` then falling back to the Visual Studio 2022 CMake install path. Configures the build dir with `cmake -S plugin -B plugin/build` if `CMakeCache.txt` is missing. Then runs `cmake --build plugin/build --config Release --target uevr_mcp`. 10-minute default timeout (generous — full rebuild from clean is ~2 min on a modern machine, incremental is ~10 s).
+
+**`uevr_plugin_stage` rationale:** when UEVR is loaded into a game, `uevr_mcp.dll` is held open by the process and Windows refuses to overwrite it. Copying the fresh build as `uevr_mcp.dll.pending` sidesteps this — on next game launch, either rename the file manually or let `uevr_install_plugin` do it. The staged file is preserved across builds.
+
+**`uevr_plugin_info` telemetry fields:**
+
+| Field | Meaning |
+|---|---|
+| `built.mtime` | When `plugin/build/Release/uevr_mcp.dll` was last written |
+| `installed.mtime` | When the DLL under `%APPDATA%\UnrealVRMod\<Game>\plugins\` was last written |
+| `pending.path` | Presence indicates a staged build waiting to activate on next launch |
+| `pluginReachable` | Whether the live plugin is responding on `http://127.0.0.1:8899` (2s timeout) |
+| `engineVersionHint` | "UE4" / "UE5" from running game's probe diagnostics, or `null` if plugin unreachable |
+| `needsInstall` | `true` when `built.mtime > installed.mtime` — the shortcut for "should I deploy?" |
+
 ## Supported games
 
 Any Unreal Engine game that UEVR supports. The core reflection tools work universally — they inspect whatever the game has loaded. Per-game differences are just different class names and field layouts, which the agent discovers through exploration.
 
-Games tested with:
-- Unreal Engine 4.x titles (float vectors, single-precision)
-- Unreal Engine 5.x titles (double vectors, Nanite, Lumen)
+Engine versions tested with:
+- Unreal Engine 4.22–4.27 titles (float vectors, single-precision) — live UEVR pipeline
+- Unreal Engine 5.x titles via emit-side — USMAP → UHT project → UE 5.5 compile-check passes through UHT
+- `engineVersionHint` probe auto-reports "UE4" vs "UE5" based on presence of `DoubleProperty` in GUObjectArray
 
 ### Game-by-game dump pipeline
 
@@ -796,6 +1062,21 @@ Games tested with:
 | Stellar Blade | 4.26.2 | Denuvo | DX12 | Dumper-7 + `uht_from_usmap` | 6946 structs + 1837 enums, 8783 headers |
 
 Denuvo / DX12 / AAA-size by themselves are **not** blockers for the live pipeline — Hogwarts Legacy validates that combo cleanly. The Stellar Blade fallback is specific to that title's custom UE4.26.2 fork, which crashes UEVR's `FViewport::GetRenderTargetTexture` PointerHook on the first rendered frame (see [Troubleshooting](#troubleshooting--game-specific-notes) for the signature).
+
+### Emit-side UE 5.5 validation
+
+`uevr_compile_check` validates the full emit pipeline against an installed UE 5.5 toolchain. Latest run — RoboQuest USMAP (Dumper-7 source) → UHT project with `engineAssociation: "5.5"` → compile inside a blank UE 5.5 C++ project:
+
+| Metric | Value |
+|---|---|
+| Emitted UHT headers | 6927 |
+| Headers skipped as engine-name collisions | 4489 |
+| Headers copied to the host project | 2438 |
+| UHT parses clean | 2402 |
+| Emitter-defect hits | 36 (struct-vs-class super misclassification) |
+| UBT wall time | ~12 s end-to-end (UHT parse + module compile + link) |
+
+A single `UnrealEditor-SDK.dll` is produced on a subset emit, confirming the generated headers survive both UHT's reflection pass and MSVC's C++ compile.
 
 ## Troubleshooting / game-specific notes
 
@@ -841,29 +1122,33 @@ Game's UE build puts the target field outside our candidate offset range. Extend
 
 FModel's parser is sometimes stricter about compression. Re-dump with `compression: "none"` (the default). If you passed `compression: "brotli"`, FModel may not support brotli in your build — the jmap-compatible path never compresses.
 
-## Further improvements worth doing
+## Roadmap
 
-Ordered by impact:
+Shipped in recent commits:
 
-1. **`uevr_dump_project(gameExe)` — one-button smart dump.** Auto-detects: game running? launch. UEVR survives injection? live pipeline (richer output). UEVR crashes? Dumper-7 fallback. Single entry point for agents that just want "the project". Writes a `<GameName>.json` profile file with the decision so reruns are instant.
+- `uevr_dump_project` one-call smart dump with live-first / Dumper-7 fallback decision caching
+- Phase 4C CDO default values rendered as `= FName(TEXT("..."))` / `= 0.5f` initializers in emitted UHT headers
+- Dumper-7 `GObjects-Dump-WithProperties.txt` offset backfill into `uevr_dump_uht_from_usmap` output
+- Per-game profile persistence in `~/.uevr-mcp/state.json`
+- `uevr_build_info` + `uevr_diff_usmap` for supply-chain + patch-diff workflows
+- UE5 probe range widening (UClass to 0x160, FProperty to 0xB0) + `engineVersionHint` in `uevr_probe_status`
+- Kismet bytecode preview — `UFunction::Script` probe + EX_* opcode mnemonic list in method JSON and emitter output
+- `uevr_compile_check` — runs real UnrealBuildTool + UHT against emitted headers and reports per-file pass/fail, with automatic engine-type collision filtering
+- `uevr_plugin_rebuild` / `uevr_plugin_stage` / `uevr_plugin_info` — plugin dev workflow
 
-2. **Phase 4C: CDO default values.** Walk `UClass::ClassDefaultObject` (exposed by UEVR API) and emit `= 0.5f` / `= FVector(0,0,1)` initializers in UHT headers. Meaningful for mod dev — lets you see default balance constants at a glance. ~1 day.
+Still open, ordered by impact:
 
-3. **Dumper-7 → offset backfill for the USMAP-only path.** Dumper-7's `GObjects-Dump-WithProperties.txt` contains real offsets (same format as `[0x35A0] {addr} ObjectProperty AIOwner`). A small parser could backfill into our `uevr_dump_uht_from_usmap` output, closing the biggest quality gap on the fallback path. Gets Stellar Blade to offset-accurate headers without touching UEVR. ~4 hours.
+1. **Struct-vs-class super-kind inference.** The compile-check still surfaces ~36 emitter defects on RoboQuest where game code inherits from engine structs but the emitter emitted it as a class. Fix: during engine-header scan, track kind per type (class / struct / interface), then match the declared super's kind and flip emission accordingly.
 
-4. **Game profile persistence.** Remember per-game settings in `~/.uevr-mcp/state.json` — last game exe, whether stability mode helped, preferred module filter, UE version. Second dump of the same game becomes a one-liner.
+2. **Single-header drop-in SDK.** Alongside the multi-file `uevr_dump_uht_sdk` output, emit one `sdk.hpp` that concatenates everything. Matches what [Dumper-7](https://github.com/Encryqed/Dumper-7) ships. Useful for quick drop-in C++ mods that don't want to build a full editor project.
 
-5. **UE5 test coverage.** All current probes and validation was done on UE4.22–4.27 titles. Should verify on a UE5.x game (Robocop Rogue City, Satisfactory, Senua's Saga) — the `UClass::ClassWithin` anchor may sit at a different offset.
+3. **Full Kismet decompiler.** Current bytecode preview is opcode mnemonics only. Integrating [KismetKompiler](https://github.com/TGE-TJ/KismetKompiler) or [Kismet Analyzer](https://github.com/trumank/kismet-analyzer) could produce real method bodies in the UHT output instead of mnemonic comments.
 
-6. **Kismet / Blueprint bytecode decompilation.** We access `UFunction::Script` but don't decompile. Integrating [KismetKompiler](https://github.com/TGE-TJ/KismetKompiler) or [Kismet Analyzer](https://github.com/trumank/kismet-analyzer) could produce real method bodies in the UHT output instead of stubs.
+4. **True live plugin hot-reload.** Current `uevr_plugin_rebuild` + `_stage` requires a game restart to pick up new builds. A proxy-shim approach — thin `uevr_mcp.dll` that `LoadLibrary`s the real impl and supports re-loading — would eliminate the restart.
 
-7. **Single-header drop-in SDK.** Alongside the multi-file `uevr_dump_uht_sdk` output, emit one `sdk.hpp` that concatenates everything. Matches what [Dumper-7](https://github.com/Encryqed/Dumper-7) ships. Useful for quick drop-in C++ mods that don't want to build a full editor project.
+5. **MCP Prompts for common workflows.** Define templates like "Bring up VR for Game X", "Find the player's health field", "Snapshot → do action → diff" that agents can invoke by name.
 
-8. **MCP Prompts for common workflows.** Define templates like "Bring up VR for Game X", "Find the player's health field", "Snapshot → do action → diff" that agents can invoke by name.
-
-9. **Runtime-patch UEVR's FFakeStereoRenderingHook** so the live pipeline works on Stellar Blade and similar. Find the hook-installation function via AoB scan of the "is stereo enabled called!" / "UGameViewportClient::Draw called for the first time." string xrefs, NOP the stereo-hook installation. Nontrivial but would eliminate the last known gap vs jmap.
-
-10. **Plugin hot-reload.** Currently every plugin rebuild requires killing the game. A proxy-DLL approach (thin `uevr_mcp.dll` that `LoadLibrary`s the real impl and supports re-loading) would speed plugin dev dramatically.
+6. **Runtime-patch UEVR's FFakeStereoRenderingHook** so the live pipeline works on Stellar Blade and similar. Find the hook-installation function via AoB scan of the "is stereo enabled called!" / "UGameViewportClient::Draw called for the first time." string xrefs, NOP the stereo-hook installation. Nontrivial but would eliminate the last known gap vs jmap.
 
 ## License
 
