@@ -59,6 +59,15 @@ if (args.Length > 0)
             Console.WriteLine(UevrMcp.SetupTools.SetupGame(args[1]).GetAwaiter().GetResult());
             return 0;
         }
+        case "attach":
+        {
+            // attach-only — game must already be running. Use when the game
+            // has a Steam / Denuvo / EAC launcher-stub that doesn't survive
+            // direct exe invocation (Hogwarts Legacy etc.).
+            if (args.Length < 2) { Console.Error.WriteLine("usage: attach <gameExe>"); return 2; }
+            Console.WriteLine(UevrMcp.SetupTools.SetupGame(args[1], launchIfMissing: false).GetAwaiter().GetResult());
+            return 0;
+        }
         case "stop-game":
         {
             if (args.Length < 2) { Console.Error.WriteLine("usage: stop-game <gameExe>"); return 2; }
