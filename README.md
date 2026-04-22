@@ -13,7 +13,10 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that g
 - **ProcessEvent listener.** Start/stop a global ProcessEvent hook to capture every Blueprint and native function call in real time — filter by name, ignore noisy ticks, establish baselines, and discover what the game does when you take an action. Equivalent to UEVR's Developer tab.
 - **Motion controller attachment.** Attach any actor or component to a VR controller hand with position/rotation offsets — the core mechanism for making VR mods feel native.
 - **Timer/scheduler.** Create one-shot or repeating timers that execute Lua code, with full lifecycle management (list, cancel, clear).
-- **Works across games.** Same 137 tools work on any Unreal Engine game that UEVR supports.
+- **Dump a buildable UE project from a running game.** One call produces a `.uproject` + per-module `Source/<Module>/{Public,Private}/*.h` tree with real `UCLASS(Config=Game) / UPROPERTY(EditAnywhere, Replicated) / AActor* Owner` headers, real property offsets, typed object refs, enum entries, and interface inheritance — the same output jmap's reconstruction flow produces, one MCP call. Falls back to [Dumper-7](https://github.com/Encryqed/Dumper-7) + USMAP conversion for games where UEVR's render hooks are fragile.
+- **Byte-compatible USMAP output.** Drop the file next to FModel / CUE4Parse / UAssetAPI to parse unversioned cooked assets for the game. Validated by round-tripping through jmap's own USMAP parser.
+- **Self-discovering reflection probes.** Property-subclass fields UEVR's public API doesn't expose (FObjectProperty::PropertyClass, FMapProperty::KeyProp, UClass::ClassFlags / ClassConfigName / Interfaces[], delegate signatures) get located at runtime via SEH-guarded memory probes with UObjectHook-backed validation — works across UE4.22–UE5.4 and across games without a hardcoded offset table.
+- **Works across games.** Same 168 tools work on any Unreal Engine game that UEVR supports, plus a Dumper-7 fallback path for games too fragile for UEVR's render hooks.
 
 ## Setup
 
@@ -63,6 +66,132 @@ To register manually:
 
 Start the game, inject UEVR, and the plugin starts automatically. The HTTP server listens on `localhost:8899`. The MCP server connects to it on first tool call.
 
+Prefer the one-call flow below — `uevr_setup_game` handles plugin install + process launch + backend injection + verification in a single call.
+
+## Launching and lifecycle
+
+The `SetupTools` + `ReadinessTools` surface turns "point the MCP at a game exe" into a one-call flow. Behind the scenes the tool: copies `uevr_mcp.dll` into `%APPDATA%\UnrealVRMod\<GameName>\plugins\`, launches the game with `-windowed` (or your launch args), waits for the main window, injects `UEVRBackend.dll` via `CreateRemoteThread` + `LoadLibraryA`, and polls `Process.Modules` until both modules show up.
+
+```
+uevr_setup_paths                          # verify plugin + backend DLLs are found
+uevr_find_steam_game { query: "robo" }    # locate exe under any Steam library
+uevr_setup_game { gameExe: "E:\\...\\MyGame-Win64-Shipping.exe" }
+uevr_wait_for_plugin { timeoutMs: 30000 } # block until HTTP :8899 responds
+uevr_is_ready                             # single green/red: process+backend+plugin+HTTP
+```
+
+`uevr_setup_game` is idempotent against an already-running game — it reuses the PID and just injects. `uevr_stop_game` does a graceful `WM_CLOSE` then falls back to `Kill` after `gracefulMs`, with `force=true` for immediate termination. `uevr_uevr_log` tails `%APPDATA%\UnrealVRMod\<GameName>\log.txt` (the UEVR host log, distinct from `uevr_get_log` which is the plugin's own ring buffer).
+
+**Fragile-game stability mode.** Some games crash UEVR's stereo render hook on the first frame after injection. For those, `uevr_write_stability_config` writes a conservative `config.txt` (ExtremeCompatibilityMode, 2DScreenMode, skip PostInitProperties, alternating render method) before launch, and `uevr_suppress_d3d_monitor` suspends UEVR's worker threads after injection — this breaks the 10-second rehook retry cycle that tears down D3D mid-render. See the [Troubleshooting](#troubleshooting--game-specific-notes) section for what works on which game class.
+
+## Dumping a UE game to a buildable project
+
+This is the headline workflow. The MCP produces jmap-equivalent output: a full `.uproject` tree you can drop into the UE4/UE5 editor and compile with UnrealHeaderTool.
+
+### Quick start (~30 seconds end-to-end on a Steam indie):
+
+```
+# 1. Set up + inject
+uevr_setup_game      { gameExe: "E:\\SteamLibrary\\...\\MyGame-Win64-Shipping.exe" }
+uevr_wait_for_plugin { timeoutMs: 30000 }
+
+# 2. Dump
+uevr_dump_usmap      { outPath: "E:\\out\\mygame.usmap" }
+uevr_dump_ue_project { outDir:  "E:\\out\\MyGameMirror",
+                       projectName: "MyGameMirror",
+                       engineAssociation: "4.26" }
+
+# 3. Validate
+uevr_validate_usmap  { usmapPath: "E:\\out\\mygame.usmap" }
+```
+
+Output: a real UE4 project with `Source/<Module>/{Public,Private}/*.h` files like:
+
+```cpp
+// Source/Phoenix/Public/SpellData.h
+USTRUCT(BlueprintType)
+struct PHOENIX_API FSpellData {
+    GENERATED_BODY()
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
+    FName SpellName;          // +0x8
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
+    AActor* Instigator;       // +0x10  ← typed, A-prefix resolved
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
+    FHitResult Hit;           // +0x18  ← nested struct
+};
+```
+
+### What you get
+
+| Output | Size on a ~big AAA UE4.27 (Hogwarts Legacy) | Size on a small indie UE4.26 (Severed Steel) |
+|---|---|---|
+| USMAP (jmap-compatible, byte-verified) | 2.5 MB, 16407 structs + 2626 enums | 1.1 MB, 6194 structs + 1261 enums |
+| UE project | 141 modules, 12460 headers | 30 modules, 1649 headers |
+| Dump time | ~20 s | ~4 s |
+
+### Available dump tools
+
+| Tool | Output |
+|---|---|
+| `uevr_dump_usmap` | `.usmap` binary — FModel / CUE4Parse / UAssetAPI compatible. Version 4 (ExplicitEnumValues). Optional Brotli compression. |
+| `uevr_dump_sdk_cpp` | Cast-style C++ headers with byte offsets baked into comments. For runtime workflows (trainers, VR mods, patches) that `reinterpret_cast` game-memory addresses directly. |
+| `uevr_dump_uht_sdk` | UHT-style single-dir headers with `UCLASS / USTRUCT / UPROPERTY` macros and forward decls. Use as input to your own editor project. |
+| `uevr_dump_ue_project` | **Full UE project** — `.uproject`, `Target.cs`, per-module `Build.cs`, `Public/*.h`, `Private/<Module>.cpp`. The jmap-equivalent. |
+| `uevr_dump_reflection_json` | Raw structured JSON of every class, struct, enum with fields, offsets, property flags, tags. Feed it into your own generator. |
+| `uevr_dump_usmap_selftest` | Emit a synthetic fixture USMAP covering every tag variant — no game required. Pair with `uevr_validate_usmap` for round-trip testing. |
+| `uevr_dump_cache_status` / `uevr_dump_cache_clear` | Inspect / invalidate the per-session reflection-walk cache. Consecutive dump calls with the same filter share one walk. |
+
+### When the live pipeline doesn't work: Dumper-7 fallback
+
+A handful of games trip UEVR's `FFakeStereoRenderingHook` on first frame — the process dies before we can dump. For those, use the vendored [Dumper-7](https://github.com/Encryqed/Dumper-7) (MIT, built as `plugin/build/Release/dumper7.dll` alongside `uevr_mcp.dll`). Dumper-7 never hooks D3D — it reads reflection without touching the render pipeline, so it survives on games where UEVR can't.
+
+```
+# 1. Launch game, wait for main menu (memory stable above a threshold)
+# 2. Inject Dumper-7 — it auto-dumps into C:\Dumper-7\<GameName-Version>\
+uevr_dumper7_run { pid: 12345, gameName: "MyGame-Win64-Shipping" }
+
+# 3. Convert Dumper-7's USMAP into the same UE project we'd produce live
+uevr_dump_uht_from_usmap {
+    usmapPath: "C:\\Dumper-7\\MyGame-4.26.2-...\\Mappings\\4.26.2-0+++UE4+Release-4.26-MyGame.usmap",
+    outDir:    "E:\\out\\MyGameMirror",
+    projectName: "MyGameMirror",
+    moduleName:  "MyGame",
+    engineAssociation: "4.26"
+}
+```
+
+Output matches `uevr_dump_ue_project` in structure but omits fields USMAP doesn't carry: real property offsets (all `+0x0`), `UCLASS(Abstract, Config=X)` class-flag specifiers, `UFUNCTION` method stubs, interface inheritance lists, per-module package origin (collapses into a single flat module). Everything else — class hierarchy, `UPROPERTY` types with typed object refs, enum entries, forward decls, A/U prefixing — is the same.
+
+### Validating a USMAP
+
+```
+uevr_validate_usmap { usmapPath: "..." }
+```
+
+Two-stage check: (a) local header parse (magic, version, compression, names-section count), (b) optional round-trip through jmap's `usmap to-json` CLI (set `$USMAP_CLI` or drop `usmap.exe` on PATH; the local `E:\Github\jmap\target\release\usmap.exe` is tried automatically). Reports struct / enum counts post-parse so you can cross-check.
+
+### Probe diagnostics
+
+The reflection pipeline uses runtime probes to find FProperty / UClass field offsets that UEVR's public API doesn't expose. Probes self-discover on first use via SEH-guarded memory reads validated with `UObjectHook::exists`. Check status with:
+
+```
+uevr_probe_status
+```
+
+Output lists each probe with `status` (`resolved` / `failed` / `undiscovered`), discovered `offset`, and `hits` count. On a new game, expect all 9 probes to resolve on the first heavy dump. If any stay `undiscovered`, that game's layout is outside our candidate offset range — open an issue or extend `plugin/src/reflection/property_probes.cpp`'s candidate list.
+
+Probes covered:
+- `FObjectPropertyBase::PropertyClass` (and its SoftObject / WeakObject / LazyObject / AssetObject variants)
+- `FClassProperty::MetaClass`
+- `FInterfaceProperty::InterfaceClass`
+- `FMapProperty::KeyProp` / `ValueProp`
+- `FSetProperty::ElementProp`
+- `F*DelegateProperty::SignatureFunction`
+- `UClass::ClassWithin` (anchor — ClassFlags is at offset-0xC, ClassConfigName at offset+0x10)
+- `UClass::Interfaces` (TArray<FImplementedInterface>)
+
 ## How it works
 
 The plugin is a C++ DLL loaded by UEVR into the game process. It uses the UEVR C++ API to access Unreal Engine's reflection system — every UObject, UClass, UStruct, UFunction, and FProperty is reachable. The plugin exposes this as a REST API:
@@ -108,7 +237,72 @@ The MCP server is a thin C# translation layer. Each MCP tool maps to one HTTP en
 
 **`mcp-server/`** — A standalone .NET console app that speaks MCP over stdio. Translates tool calls into HTTP requests, falling back to the named pipe for status/log/game-info when HTTP is unavailable. Diagnostics tools map directly to the HTTP snapshot and per-surface diagnostics routes.
 
-## 137 MCP Tools
+## 168 MCP Tools
+
+### Setup & Lifecycle (8 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_setup_paths` | Report the plugin DLL / backend DLL paths the setup flow will use (overridable via `$UEVR_MCP_PLUGIN_DLL` / `$UEVR_BACKEND_DLL`) |
+| `uevr_find_steam_game` | Scan every Steam library's `steamapps/common/*/` for UE `*-Shipping.exe` — returns `{gameName, exe, libraryPath}` tuples |
+| `uevr_install_plugin` | Copy `uevr_mcp.dll` to `%APPDATA%\UnrealVRMod\<GameName>\plugins\` (idempotent) |
+| `uevr_setup_game` | One-call install + launch + inject backend + verify. Returns per-step results; reuses an already-running process if present |
+| `uevr_wait_for_plugin` | Block until the plugin's HTTP endpoint responds; polls every ~300ms, bails if the game process dies |
+| `uevr_is_ready` | Single-call health check: process alive, `UEVRBackend.dll` + `uevr_mcp.dll` loaded, HTTP responding |
+| `uevr_stop_game` | Graceful `WM_CLOSE` then `Kill` fallback after `gracefulMs`; `force=true` skips the graceful step |
+| `uevr_uevr_log` | Tail `%APPDATA%\UnrealVRMod\<GameName>\log.txt` (UEVR host log — distinct from `uevr_get_log` which is our plugin's own ring buffer) |
+
+### Reflection Dumping (11 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_dump_usmap` | Full `.usmap` binary (v4 / ExplicitEnumValues) with jmap-matching tag recursion; optional Brotli compression |
+| `uevr_dump_usmap_selftest` | Synthesize a USMAP from a built-in fixture covering every tag variant — no game required |
+| `uevr_dump_sdk_cpp` | Cast-style C++ headers with byte offsets in comments (for trainers / VR mods / raw-cast workflows) |
+| `uevr_dump_uht_sdk` | UHT-style single-dir headers with `UCLASS / USTRUCT / UPROPERTY` macros, forward decls, decoded CPF/CLASS flags |
+| `uevr_dump_ue_project` | Buildable UE project — `.uproject` + per-module `Source/<Module>/{Public,Private}/*.h` tree |
+| `uevr_dump_uht_from_usmap` | Convert any USMAP (ours, Dumper-7's, jmap's) into the same UE project — fallback for UEVR-incompatible games |
+| `uevr_dump_reflection_json` | Raw JSON of every class/struct/enum + fields + offsets + flags |
+| `uevr_dump_cache_status` / `uevr_dump_cache_clear` | Inspect / clear the per-session reflection-walk cache |
+| `uevr_probe_status` / `uevr_probe_reset` | Show which FProperty / UClass raw-offset probes have resolved, at which offsets; clear them for re-discovery |
+
+### USMAP Validation & Conversion (1 tool)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_validate_usmap` | Local header parse + optional jmap `usmap to-json` round-trip with struct/enum counts |
+
+### Dumper-7 Integration (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_dumper7_inject` | Inject our vendored `dumper7.dll` into a running UE process (no D3D hooking — survives games UEVR crashes on) |
+| `uevr_dumper7_run` | One-shot inject + wait for SDK output to finalize + return the SDK folder layout |
+| `uevr_dumper7_status` | Report DLL path resolution, output roots, latest SDK folder, whether Dumper-7 is loaded in a target |
+| `uevr_dumper7_list` | List files in a produced SDK folder (fuzzy pattern match, paginated) |
+| `uevr_dumper7_read` | Read a single generated header by path or fuzzy package-name query with byte offset / length for paging |
+
+### Memory Write (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_write_memory` | Write raw bytes (hex string or int array) to any game-process address; SEH-guarded with VirtualProtect toggling for code patches |
+| `uevr_patch_bytes` | AoB-scan + write in one call; aborts on multi-match unless `force=true` |
+
+### External Tool Wrappers (3 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_uesave` | Shell to [uesave](https://github.com/trumank/uesave-rs) for GVAS save-file `to-json` / `from-json` roundtrips |
+| `uevr_patternsleuth` | Shell to [patternsleuth](https://github.com/trumank/patternsleuth) for UE symbol / AoB signature resolution |
+| `uevr_validate_usmap` | (listed above — shells to jmap's `usmap` CLI) |
+
+### Stability Mode for Fragile Games (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `uevr_write_stability_config` | Write a conservative UEVR `config.txt` (ExtremeCompatibilityMode, 2DScreenMode, SkipPostInitProperties, etc.) to `%APPDATA%\UnrealVRMod\<GameName>\` before launch |
+| `uevr_suppress_d3d_monitor` | Enumerate threads in the target, suspend the UEVR worker threads that drive the 10-second rehook retry cycle (the classic "Last chance encountered for hooking" death loop) |
 
 ### Object Exploration (13 tools)
 
@@ -390,6 +584,60 @@ But the real power is in open-ended requests. You don't need to know the game's 
 - *"Attach the sword to my right VR hand with a comfortable grip angle."*
 - *"Use the ProcessEvent listener to figure out what happens when I open a chest, then hook those functions."*
 - *"Make the world feel twice as big — adjust the VR scale."*
+- *"Dump this game as a buildable UE4 project — I want to read the source in my editor."*
+
+### End-to-end: dump a game you've never touched before
+
+The shortest path from "I installed the game" to "I have a UE4 editor project on disk":
+
+```
+# 1. Locate it
+uevr_find_steam_game { query: "Robo" }
+→ [{gameName: "RoboQuest", exe: "E:\\SteamLibrary\\steamapps\\common\\RoboQuest\\RoboQuest\\Binaries\\Win64\\RoboQuest-Win64-Shipping.exe", libraryPath: "E:\\SteamLibrary"}]
+
+# 2. Launch + inject (or attach to a running instance)
+uevr_setup_game       { gameExe: "<exe from step 1>" }
+uevr_wait_for_plugin  { timeoutMs: 30000 }
+uevr_is_ready
+→ { ready: true, backendLoaded: true, pluginLoaded: true, httpAlive: true }
+
+# 3. Dump
+uevr_dump_usmap       { outPath: "E:\\out\\roboquest.usmap" }
+uevr_dump_ue_project  { outDir:  "E:\\out\\RoboQuestMirror",
+                        projectName: "RoboQuestMirror",
+                        engineAssociation: "4.26" }
+
+# 4. Verify
+uevr_validate_usmap   { usmapPath: "E:\\out\\roboquest.usmap" }
+→ { headerOk: true, fullParse: "ok", parsedStructCount: 5620, parsedEnumCount: 1314 }
+
+uevr_probe_status
+→ 9/9 probes resolved
+
+# 5. Cleanup
+uevr_stop_game
+```
+
+The output at `E:\out\RoboQuestMirror\` is a ready-to-open UE4 project. Open it in the UE editor, build, and you have IntelliSense / go-to-definition / decompile-Blueprints against the game's real types.
+
+### When UEVR crashes on a specific game (Dumper-7 fallback)
+
+```
+# Launch game, wait for main menu (memory stabilizes above a threshold)
+# Don't call uevr_setup_game — it would crash the game.
+
+# Inject Dumper-7 instead
+uevr_dumper7_run { pid: <running-game-pid>, gameName: "MyGame-Win64-Shipping", timeoutMs: 180000 }
+→ { sdk: { Dir: "C:\\Dumper-7\\MyGame-...", UsmapCount: 1, HppCount: 910 } }
+
+# Convert its USMAP into our UE project format
+uevr_dump_uht_from_usmap {
+    usmapPath: "C:\\Dumper-7\\MyGame-...\\Mappings\\<version>-MyGame.usmap",
+    outDir:    "E:\\out\\MyGameMirror",
+    projectName: "MyGameMirror",
+    moduleName:  "MyGame"
+}
+```
 
 ### Reverse engineering workflow: snapshot → action → diff
 
@@ -536,6 +784,85 @@ Any Unreal Engine game that UEVR supports. The core reflection tools work univer
 Games tested with:
 - Unreal Engine 4.x titles (float vectors, single-precision)
 - Unreal Engine 5.x titles (double vectors, Nanite, Lumen)
+
+### Game-by-game dump pipeline
+
+| Game | UE ver | Protection | Renderer | Pipeline | Dump result |
+|---|---|---|---|---|---|
+| RoboQuest | 4.26 | — | DX11 | live `uevr_dump_*` | 5620 structs + 1314 enums, 15 modules, 1927 headers |
+| Severed Steel | 4.26 | — | DX11 | live + stability mode | 6194 structs + 1261 enums, 30 modules, 1649 headers |
+| Hogwarts Legacy | 4.27 | Denuvo | DX12 | live `uevr_dump_*` | **16407 structs + 2626 enums, 141 modules, 12460 headers** |
+| Stellar Blade | 4.26.2 | Denuvo | DX12 | Dumper-7 + `uht_from_usmap` | 6946 structs + 1837 enums, 8783 headers |
+
+Denuvo / DX12 / AAA-size by themselves are **not** blockers for the live pipeline — Hogwarts Legacy validates that combo cleanly. The Stellar Blade fallback is specific to that title's custom UE4.26.2 fork, which crashes UEVR's `FViewport::GetRenderTargetTexture` PointerHook on the first rendered frame (see [Troubleshooting](#troubleshooting--game-specific-notes) for the signature).
+
+## Troubleshooting / game-specific notes
+
+### Game crashes ~7s after `uevr_setup_game`
+
+Check `%APPDATA%\UnrealVRMod\<GameName>\log.txt` for the last line. Two common signatures:
+
+**Signature A: UEVR stereo render hook crash** — last lines are:
+```
+FFakeStereoRenderingHook.cpp:2248 Hooking FViewport::GetRenderTargetTexture
+FFakeStereoRenderingHook.cpp:2260 UGameViewportClient::Draw called for the first time.
+FFakeStereoRenderingHook.cpp:2050 FViewport::GetRenderTargetTexture called!
+```
+…followed by process exit. Something in this specific game's render pipeline is incompatible with UEVR's PointerHook. Known on Stellar Blade. Config-level `uevr_write_stability_config` does not help. Workaround: use the Dumper-7 fallback path above.
+
+**Signature B: "Last chance encountered for hooking" retry-loop crash** — last lines cycle:
+```
+Last chance encountered for hooking
+Sending rehook request for D3D
+Hooking D3D12
+```
+…for a few iterations then die. UEVR's D3D monitor thread is re-hooking every 10s and racing with the game's live render. Call `uevr_suppress_d3d_monitor` immediately after `uevr_setup_game` to freeze the monitor — works on most games that hit this.
+
+### "Process not running" error from `uevr_setup_game`
+
+On Steam games with a launcher-stub pattern (bootstrap `<Game>.exe` at the root spawns the real game at `<Subfolder>/Binaries/Win64/<Game>.exe`), both processes share an image name. The setup tool picks the exact `MainModule.FileName` match first, but if you see this error ensure you're passing the **inner** exe path, not the root launcher.
+
+### "Plugin DLL is locked by another process"
+
+A previous setup injected `uevr_mcp.dll` into a now-crashed process and Windows is holding the file handle. `taskkill /F /PID <pid>` the stuck process and retry.
+
+### `uevr_dump_reflection_json` times out / returns transport error
+
+Two scenarios:
+1. **First heavy dump** — initial probe discovery adds per-batch overhead. The reflection walk's first batch can take several seconds. Subsequent batches in the same session hit cached probe offsets. If you see `Game thread request timed out`, bump the plugin's per-batch timeout in `plugin/src/routes/explorer_routes.cpp` (default 20s with methods, 10s without).
+2. **`includeMethods=true`** — method enumeration per class is ~10x more work than fields alone. `uevr_dump_sdk_cpp` and `uevr_dump_usmap` both default to `methods=false` (methods emit as comments only in the SDK and USMAP doesn't carry them). Only pass `includeMethods=true` if you explicitly need them.
+
+### Probes stay `undiscovered`
+
+Game's UE build puts the target field outside our candidate offset range. Extend `kUClassRange` / `kShortRange` / `kFieldRange` / `kUClassInterfacesRange` in `plugin/src/reflection/property_probes.cpp` — each is a small `int32_t[]` of candidate offsets to try. Rebuild, re-inject, re-probe.
+
+### USMAP parses with our validator but FModel rejects it
+
+FModel's parser is sometimes stricter about compression. Re-dump with `compression: "none"` (the default). If you passed `compression: "brotli"`, FModel may not support brotli in your build — the jmap-compatible path never compresses.
+
+## Further improvements worth doing
+
+Ordered by impact:
+
+1. **`uevr_dump_project(gameExe)` — one-button smart dump.** Auto-detects: game running? launch. UEVR survives injection? live pipeline (richer output). UEVR crashes? Dumper-7 fallback. Single entry point for agents that just want "the project". Writes a `<GameName>.json` profile file with the decision so reruns are instant.
+
+2. **Phase 4C: CDO default values.** Walk `UClass::ClassDefaultObject` (exposed by UEVR API) and emit `= 0.5f` / `= FVector(0,0,1)` initializers in UHT headers. Meaningful for mod dev — lets you see default balance constants at a glance. ~1 day.
+
+3. **Dumper-7 → offset backfill for the USMAP-only path.** Dumper-7's `GObjects-Dump-WithProperties.txt` contains real offsets (same format as `[0x35A0] {addr} ObjectProperty AIOwner`). A small parser could backfill into our `uevr_dump_uht_from_usmap` output, closing the biggest quality gap on the fallback path. Gets Stellar Blade to offset-accurate headers without touching UEVR. ~4 hours.
+
+4. **Game profile persistence.** Remember per-game settings in `~/.uevr-mcp/state.json` — last game exe, whether stability mode helped, preferred module filter, UE version. Second dump of the same game becomes a one-liner.
+
+5. **UE5 test coverage.** All current probes and validation was done on UE4.22–4.27 titles. Should verify on a UE5.x game (Robocop Rogue City, Satisfactory, Senua's Saga) — the `UClass::ClassWithin` anchor may sit at a different offset.
+
+6. **Kismet / Blueprint bytecode decompilation.** We access `UFunction::Script` but don't decompile. Integrating [KismetKompiler](https://github.com/TGE-TJ/KismetKompiler) or [Kismet Analyzer](https://github.com/trumank/kismet-analyzer) could produce real method bodies in the UHT output instead of stubs.
+
+7. **Single-header drop-in SDK.** Alongside the multi-file `uevr_dump_uht_sdk` output, emit one `sdk.hpp` that concatenates everything. Matches what [Dumper-7](https://github.com/Encryqed/Dumper-7) ships. Useful for quick drop-in C++ mods that don't want to build a full editor project.
+
+8. **MCP Prompts for common workflows.** Define templates like "Bring up VR for Game X", "Find the player's health field", "Snapshot → do action → diff" that agents can invoke by name.
+
+9. **Runtime-patch UEVR's FFakeStereoRenderingHook** so the live pipeline works on Stellar Blade and similar. Find the hook-installation function via AoB scan of the "is stereo enabled called!" / "UGameViewportClient::Draw called for the first time." string xrefs, NOP the stereo-hook installation. Nontrivial but would eliminate the last known gap vs jmap.
+
+10. **Plugin hot-reload.** Currently every plugin rebuild requires killing the game. A proxy-DLL approach (thin `uevr_mcp.dll` that `LoadLibrary`s the real impl and supports re-loading) would speed plugin dev dramatically.
 
 ## License
 
